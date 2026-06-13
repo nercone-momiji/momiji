@@ -10,7 +10,6 @@ class Request:
     body: bytes | None
 
 class Response:
-    request: Request
     protocol: Literal["HTTP/0.9", "HTTP/1.0", "HTTP/1.1", "HTTP/2.0", "HTTP/3.0"] | None = None
     status_code: int = 200
     status_text: str | None = None
