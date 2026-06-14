@@ -10,7 +10,7 @@ from qh3.h3.events import DataReceived as H3DataReceived, HeadersReceived
 from qh3.quic.configuration import QuicConfiguration
 from qh3.quic.events import ProtocolNegotiated, StreamDataReceived, StreamReset
 
-from .http import Request, get_response_body
+from .http import Request, Response, get_response_body
 
 if TYPE_CHECKING:
     from ..app import App
@@ -79,25 +79,30 @@ class HTTP3Protocol(QuicConnectionProtocol):
         except Exception:
             cid = b''
 
-        request = Request(
-            client=(client_ip, client_port),
-            scheme='https',
-            secure=True,
-            protocol='HTTP/3.0',
-            method=stream_data['method'],
-            target=stream_data['path'],
-            headers=stream_data['headers'],
-            body=stream_data['body'] or None,
-            tls=None,
-            quic=QUICInfo(connection_id=cid, stream_id=stream_id)
-        )
-        response = self.app(request)
-        body_bytes = get_response_body(response)
+        try:
+            request = Request(
+                client=(client_ip, client_port),
+                scheme='https',
+                secure=True,
+                protocol='HTTP/3.0',
+                method=stream_data['method'],
+                target=stream_data['path'],
+                headers=stream_data['headers'],
+                body=stream_data['body'] or None,
+                tls=None,
+                quic=QUICInfo(connection_id=cid, stream_id=stream_id)
+            )
+            response = self.app(request)
+            body = get_response_body(response)
 
-        resp_headers = [(b':status', str(response.status_code).encode()), (b'content-length', str(len(body_bytes)).encode())] + [(k.encode() if isinstance(k, str) else k, v.encode() if isinstance(v, str) else v) for k, v in response.headers.items()]
+        except Exception:
+            response = Response("Internal Server Error".encode(), status_code=500)
+            body = "Internal Server Error".encode()
+
+        resp_headers = [(b':status', str(response.status_code).encode()), (b'content-length', str(len(body)).encode())] + [(k.encode() if isinstance(k, str) else k, v.encode() if isinstance(v, str) else v) for k, v in response.headers.items()]
 
         self.http.send_headers(stream_id=stream_id, headers=resp_headers)
-        self.http.send_data(stream_id=stream_id, data=body_bytes, end_stream=True)
+        self.http.send_data(stream_id=stream_id, data=body, end_stream=True)
         self.transmit()
 
 class QUICServer:

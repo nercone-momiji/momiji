@@ -91,21 +91,26 @@ async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 elif isinstance(event, h11.EndOfMessage):
                     if method is None:
                         return
-                    request = Request(
-                        client=(client_ip, client_port),
-                        scheme=scheme,
-                        secure=secure,
-                        protocol='HTTP/1.1',
-                        method=method,
-                        target=target or '/',
-                        headers=headers or {},
-                        body=b''.join(body_chunks) or None,
-                        tls=None,
-                        quic=None
-                    )
+                    try:
+                        request = Request(
+                            client=(client_ip, client_port),
+                            scheme=scheme,
+                            secure=secure,
+                            protocol='HTTP/1.1',
+                            method=method,
+                            target=target or '/',
+                            headers=headers or {},
+                            body=b''.join(body_chunks) or None,
+                            tls=None,
+                            quic=None
+                        )
 
-                    response = app(request)
-                    body = get_response_body(response)
+                        response = app(request)
+                        body = get_response_body(response)
+
+                    except Exception:
+                        response = Response("Internal Server Error".encode(), status_code=500)
+                        body = "Internal Server Error".encode()
 
                     writer.write(connection.send(h11.Response(
                         status_code=response.status_code,
@@ -140,20 +145,26 @@ async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             pass
 
 async def respond_h2(conn: H2Connection, writer: asyncio.StreamWriter, lock: asyncio.Lock, stream_id: int, stream_data: dict, app, client_ip: ipaddress.IPv4Address | ipaddress.IPv6Address, client_port: int) -> None:
-    request = Request(
-        client=(client_ip, client_port),
-        scheme='https',
-        secure=True,
-        protocol='HTTP/2.0',
-        method=stream_data['method'],
-        target=stream_data['path'],
-        headers=stream_data['headers'],
-        body=stream_data['body'] or None,
-        tls=None,
-        quic=None
-    )
-    response = app(request)
-    body = get_response_body(response)
+    try:
+        request = Request(
+            client=(client_ip, client_port),
+            scheme='https',
+            secure=True,
+            protocol='HTTP/2.0',
+            method=stream_data['method'],
+            target=stream_data['path'],
+            headers=stream_data['headers'],
+            body=stream_data['body'] or None,
+            tls=None,
+            quic=None
+        )
+        response = app(request)
+        body = get_response_body(response)
+
+    except Exception:
+        response = Response("Internal Server Error".encode(), status_code=500)
+        body = "Internal Server Error".encode()
+
     resp_headers = [(':status', str(response.status_code))]
     resp_headers += list(response.headers.items())
     resp_headers.append(('content-length', str(len(body))))
