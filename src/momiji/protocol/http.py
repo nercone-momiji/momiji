@@ -28,6 +28,47 @@ if TYPE_CHECKING:
     from ..app import App
     from .quic import QUICInfo
 
+class Headers:
+    def __init__(self, headers: dict[str, str]):
+        self.headers: dict[str, list[str]] = {}
+        for k, v in headers.items():
+            self.append(k, v)
+
+    def __getitem__(self, key: str) -> str | None:
+        return self.get(key)
+
+    def __setitem__(self, key: str, value: str):
+        self.set(key, value)
+
+    def __iter__(self) -> dict[str, list[str]]:
+        return self.headers
+
+    def __contains__(self, item: str):
+        return item.lower() in self.headers
+
+    def get(self, key: str, default=None) -> str | None:
+        if key in self.headers:
+            return ", ".join(self.headers.get(key.lower()))
+        else:
+            return default
+
+    def get_all(self, key: str) -> list[str] | None:
+        return self.headers.get(key.lower())
+
+    def set(self, key: str, value: str, override: bool = True):
+        if override or key.lower() not in self.headers:
+            self.headers[key.lower()] = [value]
+
+    def append(self, key: str, value: str):
+        key = key.lower()
+        if key in self.headers:
+            self.headers[key].append(value)
+        else:
+            self.headers[key] = [value]
+
+    def items(self) -> list[tuple[str, str]]:
+        return [(k, v) for k, values in self.headers.items() for v in values]
+
 @dataclass
 class Request:
     client: tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int]
@@ -37,7 +78,7 @@ class Request:
     protocol: Literal["HTTP/0.9", "HTTP/1.0", "HTTP/1.1", "HTTP/2.0", "HTTP/3.0"]
     method: Literal["GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"]
     target: str
-    headers: dict[str, str]
+    headers: Headers
     body: bytes | None
 
     tls: TLSInfo | None
@@ -47,7 +88,7 @@ class Request:
 class Response:
     body: bytes | None = None
     status_code: int = 200
-    headers: dict[str, str] = field(default_factory=dict)
+    headers: Headers = field(default_factory=lambda: Headers({}))
 
     compression: bool = True
     minification: bool = False
@@ -100,7 +141,7 @@ async def compress_gzip(body: bytes) -> bytes:
 async def compress_deflate(body: bytes) -> bytes:
     return zlib.compress(body, level=6)
 
-async def compress(type: Literal["zstd", "br", "gzip", "deflate"], body: bytes) -> bytes:
+async def compress(type: str, body: bytes) -> bytes | None:
     if type == "zstd":
         return await compress_zstd(body)
     elif type == "br":
@@ -109,6 +150,8 @@ async def compress(type: Literal["zstd", "br", "gzip", "deflate"], body: bytes) 
         return await compress_gzip(body)
     elif type == "deflate":
         return await compress_deflate(body)
+    else:
+        return None
 
 def sniff_content_type(body: bytes) -> str:
     try:
@@ -126,37 +169,32 @@ def sniff_content_type(body: bytes) -> str:
 async def process(app: App, request: Request) -> Response:
     try:
         response = app(request)
-        response.headers = {k.lower(): v for k, v in response.headers.items()}
     except Exception:
         response = Response(b"Internal Server Error", status_code=500)
 
-    def set_header(key: str, value: str, override: bool = False):
-        if override or key.lower() not in response.headers:
-            response.headers[key.lower()] = value
+    if response.body:
+        response.headers.set("content-type", sniff_content_type(response.body), override=False)
 
-    if response.body and "content-type" not in response.headers:
-        response.headers["content-type"] = sniff_content_type(response.body)
+        minimized = False
+        if response.minification:
+            content_type = response.headers.get("content-type", "")
+            if minimized_body := await minimize(content_type, response.body):
+                minimized = True
+                response.body = minimized_body
 
-    minimized = False
-    if response.minification:
-        content_type = response.headers.get("content-type", "")
-        if minimized_body := await minimize(content_type, response.body):
-            minimized = True
-            response.body = minimized_body
+        compressed = False
+        if response.compression:
+            for encoding in ["zstd", "br", "gzip", "deflate"]:
+                if not encoding in request.headers.get("accept-encoding", "").split(", "):
+                    continue
+                compressed = True
+                response.body = await compress(encoding, response.body)
+                response.headers.set("Content-Encoding", encoding)
 
-    compressed = False
-    if response.compression:
-        for encoding in ["zstd", "br", "gzip", "deflate"]:
-            if not encoding in response.headers.get("content-type", "").split(", "):
-                continue
-            compressed = True
-            response.body = await compress(encoding, response.body)
-            set_header("Content-Encoding", encoding, True)
+    response.headers.set("Content-Length", str(len(response.body) if response.body else 0), override=minimized or compressed)
 
-    set_header("Content-Length", str(len(response.body)), minimized or compressed)
-
-    set_header("Server", "Momiji")
-    set_header("X-Powered-By", "Momiji")
+    response.headers.set("Server", "Momiji", override=False)
+    response.headers.set("X-Powered-By", "Momiji", override=False)
 
     return response
 
@@ -168,10 +206,10 @@ def parse_peername(addr) -> tuple[ipaddress.IPv4Address | ipaddress.IPv6Address,
     except (ValueError, IndexError):
         return ipaddress.IPv4Address('127.0.0.1'), 0
 
-def parse_pseudo_headers(raw_headers: Iterable[tuple]) -> tuple[str, str, dict[str, str]]:
+def parse_pseudo_headers(raw_headers: Iterable[tuple]) -> tuple[str, str, Headers]:
     method = 'GET'
     path = '/'
-    headers: dict[str, str] = {}
+    headers = Headers({})
     for raw_k, raw_v in raw_headers:
         k = raw_k.decode('latin-1') if isinstance(raw_k, bytes) else raw_k
         v = raw_v.decode('latin-1') if isinstance(raw_v, bytes) else raw_v
@@ -180,7 +218,7 @@ def parse_pseudo_headers(raw_headers: Iterable[tuple]) -> tuple[str, str, dict[s
         elif k == ':path':
             path = v
         elif not k.startswith(':'):
-            headers[k] = v
+            headers.append(k, v)
     return method, path, headers
 
 async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, app: App):
@@ -195,7 +233,7 @@ async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         while True:
             method: str | None = None
             target: str | None = None
-            request_headers: dict[str, str] | None = None
+            request_headers: Headers = Headers({})
             body_chunks: list[bytes] = []
 
             while True:
@@ -213,7 +251,7 @@ async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 elif isinstance(event, h11.Request):
                     method = event.method.decode()
                     target = event.target.decode()
-                    request_headers = {k.decode().lower(): v.decode() for k, v in event.headers}
+                    request_headers = Headers({k.decode(): v.decode() for k, v in event.headers})
 
                 elif isinstance(event, h11.Data):
                     body_chunks.append(event.data)
@@ -229,7 +267,7 @@ async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         protocol='HTTP/1.1',
                         method=method,
                         target=target or '/',
-                        headers=request_headers or {},
+                        headers=request_headers,
                         body=b''.join(body_chunks) or None,
                         tls=tls,
                         quic=None
@@ -268,8 +306,8 @@ async def respond_http2(conn: H2Connection, writer: asyncio.StreamWriter, lock: 
     response = await process(app, request)
 
     async with lock:
-        conn.send_headers(stream_id=stream_id, headers=list(response.headers.items()))
-        conn.send_data(stream_id=stream_id, data=response.body, end_stream=True)
+        conn.send_headers(stream_id=stream_id, headers=[(b':status', str(response.status_code).encode()), list(response.headers.items())])
+        conn.send_data(stream_id=stream_id, data=response.body or b"", end_stream=True)
         to_send = conn.data_to_send()
         if to_send:
             writer.write(to_send)
