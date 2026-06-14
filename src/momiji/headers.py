@@ -47,9 +47,9 @@ class Cookie:
     def __init__(self, cookies: str | list[CookieItem] | None = None):
         self.initial: list[CookieItem] = []
         if isinstance(cookies, str):
-            self.initial = Cookie.from_header(cookies)
+            self.initial = Cookie.from_header(cookies).initial
         elif isinstance(cookies, list):
-            self.initial = cookies
+            self.initial = cookies.copy()
         self.cookies: list[CookieItem] = self.initial.copy()
 
     def append(self, item: CookieItem):
@@ -135,7 +135,7 @@ class CSP:
                 parts.append(key)
             elif isinstance(value, str) and value:
                 parts.append(f"{key} {value}")
-            else:
+            elif isinstance(value, list) and len(value) > 0:
                 parts.append(f"{key} {' '.join(value)}")
         return "; ".join(parts).strip()
 
@@ -208,7 +208,7 @@ class CacheControl:
 
 class ServerTiming:
     def __init__(self):
-        self.timings: dict[str, list[float, float | None, str | None]] = {}
+        self.timings: dict[str, list[float | str | None]] = {}
 
     def start(self, key: str, description: str | None = None) -> float:
         if key in self.timings:

@@ -1,7 +1,10 @@
 import os
 from typing import Literal
+from dataclasses import dataclass
+
 from .config import Config
 
+@dataclass
 class Request:
     method: Literal["GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"]
     target: str
@@ -9,6 +12,7 @@ class Request:
     headers: dict[str,str]
     body: bytes | None
 
+@dataclass
 class Response:
     protocol: Literal["HTTP/0.9", "HTTP/1.0", "HTTP/1.1", "HTTP/2.0", "HTTP/3.0"] | None = None
     status_code: int = 200
