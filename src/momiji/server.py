@@ -113,8 +113,8 @@ class Server:
         if self.config.certfile and self.config.bind_https:
             ssl_ctx = create_ssl_context(self.config)
 
-        http11_handler = lambda r, w: handle_http11(r, w, self.app)
-        https_handler = lambda r, w: handle_https(r, w, self.app)
+        http11_handler = lambda r, w: handle_http11(r, w, self.app, self.config)
+        https_handler = lambda r, w: handle_https(r, w, self.app, self.config)
 
         for kind, sock in bound:
             if kind == 'unix':

@@ -41,9 +41,6 @@ class Headers:
     def __setitem__(self, key: str, value: str):
         self.set(key, value)
 
-    def __iter__(self) -> dict[str, list[str]]:
-        return self.headers
-
     def __contains__(self, item: str):
         return item.lower() in self.headers
 
@@ -222,7 +219,7 @@ def parse_pseudo_headers(raw_headers: Iterable[tuple]) -> tuple[str, str, Header
             headers.append(k, v)
     return method, path, headers
 
-async def send_simple_response_h11(connection: h11.Connection, writer: asyncio.StreamWriter, status_code: int, body: bytes) -> None:
+async def send_simple_response_http11(connection: h11.Connection, writer: asyncio.StreamWriter, status_code: int, body: bytes) -> None:
     try:
         out = connection.send(h11.Response(status_code=status_code, headers=[("content-length", str(len(body))), ("content-type", "text/plain"), ("connection", "close")]))
         out += connection.send(h11.Data(data=body))
@@ -256,7 +253,7 @@ async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         data = await asyncio.wait_for(reader.read(65536), timeout=config.request_read_timeout)
                     except asyncio.TimeoutError:
                         if method is not None:
-                            await send_simple_response_h11(connection, writer, 408, b"Request Timeout")
+                            await send_simple_response_http11(connection, writer, 408, b"Request Timeout")
                         return
                     except Exception:
                         return
@@ -273,7 +270,7 @@ async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     if content_length is not None:
                         try:
                             if int(content_length) > config.request_max_body_size:
-                                await send_simple_response_h11(connection, writer, 413, b"Payload Too Large")
+                                await send_simple_response_http11(connection, writer, 413, b"Payload Too Large")
                                 return
                         except ValueError:
                             pass
@@ -281,7 +278,7 @@ async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 elif isinstance(event, h11.Data):
                     body_size += len(event.data)
                     if body_size > config.request_max_body_size:
-                        await send_simple_response_h11(connection, writer, 413, b"Payload Too Large")
+                        await send_simple_response_http11(connection, writer, 413, b"Payload Too Large")
                         return
                     body_chunks.append(event.data)
 
@@ -335,7 +332,7 @@ async def respond_http2(conn: H2Connection, writer: asyncio.StreamWriter, lock: 
     response = await process(app, request)
 
     async with lock:
-        conn.send_headers(stream_id=stream_id, headers=[(b':status', str(response.status_code).encode()), list(response.headers.items())])
+        conn.send_headers(stream_id=stream_id, headers=[(b':status', str(response.status_code).encode()), response.headers.items()])
         conn.send_data(stream_id=stream_id, data=response.body or b"", end_stream=True)
         to_send = conn.data_to_send()
         if to_send:
@@ -346,8 +343,8 @@ async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
     client = parse_peername(writer.get_extra_info('peername'))
     tls = extract_tls_info(writer.get_extra_info('ssl_object'))
 
-    config = H2Configuration(client_side=False, header_encoding='utf-8')
-    connection = H2Connection(config=config)
+    h2_config = H2Configuration(client_side=False, header_encoding='utf-8')
+    connection = H2Connection(config=h2_config)
     lock = asyncio.Lock()
 
     async with lock:
@@ -460,9 +457,9 @@ async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         except Exception:
             pass
 
-async def handle_https(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, app: App):
+async def handle_https(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, app: App, config: Config):
     ssl_object = writer.get_extra_info('ssl_object')
     if ssl_object is not None and ssl_object.selected_alpn_protocol() == 'h2':
-        await handle_http2(reader, writer, app)
+        await handle_http2(reader, writer, app, config)
     else:
-        await handle_http11(reader, writer, app)
+        await handle_http11(reader, writer, app, config)

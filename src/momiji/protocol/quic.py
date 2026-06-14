@@ -23,11 +23,13 @@ class QUICInfo:
 
 class HTTP3Protocol(QuicConnectionProtocol):
     app: "App" = None
+    config: "Config" = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.http: H3Connection | None = None
         self.streams: dict[int, dict] = {}
+        self.rejected: set[int] = set()
         self.tasks: set[asyncio.Task] = set()
         self.client_ip: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.IPv4Address('127.0.0.1')
         self.client_port: int = 0
@@ -60,21 +62,49 @@ class HTTP3Protocol(QuicConnectionProtocol):
             for h3_event in self.http.handle_event(event):
                 if isinstance(h3_event, HeadersReceived):
                     method, path, headers = parse_pseudo_headers(h3_event.headers)
+                    content_length = headers.get("content-length")
+                    if content_length is not None:
+                        try:
+                            if int(content_length) > self.config.request_max_body_size:
+                                self.rejected.add(h3_event.stream_id)
+                                self.send_simple_response(h3_event.stream_id, 413, b"Payload Too Large")
+                                continue
+                        except ValueError:
+                            pass
                     self.streams[h3_event.stream_id] = {
                         'method': method,
                         'path': path,
                         'headers': headers,
-                        'body': bytearray()
+                        'body': bytearray(),
+                        'body_size': 0
                     }
                     if h3_event.stream_ended:
                         self.dispatch(h3_event.stream_id)
 
                 elif isinstance(h3_event, H3DataReceived):
+                    if h3_event.stream_id in self.rejected:
+                        continue
+
                     if h3_event.stream_id in self.streams:
-                        self.streams[h3_event.stream_id]['body'] += h3_event.data
+                        stream = self.streams[h3_event.stream_id]
+                        stream['body_size'] += len(h3_event.data)
+                        if stream['body_size'] > self.config.request_max_body_size:
+                            self.streams.pop(h3_event.stream_id)
+                            self.rejected.add(h3_event.stream_id)
+                            self.send_simple_response(h3_event.stream_id, 413, b"Payload Too Large")
+                            continue
+                        stream['body'] += h3_event.data
 
                     if h3_event.stream_ended and h3_event.stream_id in self.streams:
                         self.dispatch(h3_event.stream_id)
+
+    def send_simple_response(self, stream_id: int, status_code: int, body: bytes):
+        try:
+            self.http.send_headers(stream_id=stream_id, headers=[(b':status', str(status_code).encode())])
+            self.http.send_data(stream_id=stream_id, data=body, end_stream=True)
+            self.transmit()
+        except Exception:
+            pass
 
     def connection_lost(self, exc):
         for t in self.tasks:
@@ -127,6 +157,7 @@ class QUICServer:
         def make_protocol(*args, **kwargs):
             proto = HTTP3Protocol(*args, **kwargs)
             proto.app = self.app
+            proto.config = self.config
             return proto
 
         async with quic_serve(self.host, self.port, configuration=quic_config, create_protocol=make_protocol):
