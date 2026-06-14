@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import puremagic
 from async_lru import alru_cache
 from typing import TYPE_CHECKING, Iterable, Literal
 from dataclasses import dataclass, field
@@ -109,6 +110,19 @@ async def compress(type: Literal["zstd", "br", "gzip", "deflate"], body: bytes) 
     elif type == "deflate":
         return await compress_deflate(body)
 
+def sniff_content_type(body: bytes) -> str:
+    try:
+        mime = puremagic.from_string(body, mime=True)
+    except puremagic.PureError:
+        try:
+            body.decode("utf-8")
+            mime = "text/plain"
+        except UnicodeDecodeError:
+            mime = "application/octet-stream"
+    if mime.startswith("text/") and "charset" not in mime:
+        mime += "; charset=utf-8"
+    return mime
+
 async def process(app: App, request: Request) -> Response:
     try:
         response = app(request)
@@ -119,6 +133,9 @@ async def process(app: App, request: Request) -> Response:
     def set_header(key: str, value: str, override: bool = False):
         if override or key.lower() not in response.headers:
             response.headers[key.lower()] = value
+
+    if response.body and "content-type" not in response.headers:
+        response.headers["content-type"] = sniff_content_type(response.body)
 
     minimized = False
     if response.minification:

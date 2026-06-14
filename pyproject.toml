@@ -16,14 +16,13 @@ dependencies = [
     "qh3",
     "uvloop",
     "async-lru",
-
     "minify-html",
     "rcssmin",
     "rjsmin",
     "scour",
-
     "zstandard",
-    "brotlicffi"
+    "brotlicffi",
+    "puremagic>=1.30",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
