@@ -11,9 +11,6 @@ authors = [ { name = "Nercone", email = "nercone@nercone.dev" } ]
 license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
-    "h11",
-    "h2",
-    "qh3",
     "uvloop",
     "async-lru",
     "minify-html",
@@ -22,7 +19,7 @@ dependencies = [
     "scour",
     "zstandard",
     "brotlicffi",
-    "puremagic>=1.30",
+    "puremagic"
 ]
 classifiers = [
     "Programming Language :: Python :: 3",

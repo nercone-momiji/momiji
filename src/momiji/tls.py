@@ -3,10 +3,9 @@ import ctypes
 import ctypes.util
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
-from dataclasses import dataclass
 
 if TYPE_CHECKING:
-    from ..config import Config
+    from .config import Config
 
 class Group(Enum):
     # Classic
@@ -225,12 +224,6 @@ class Cipher(Enum):
     TLS_AES_256_GCM_SHA384       = "TLS_AES_256_GCM_SHA384"
     TLS_CHACHA20_POLY1305_SHA256 = "TLS_CHACHA20_POLY1305_SHA256"
 
-@dataclass
-class TLSInfo:
-    version: Literal["1.0", "1.1", "1.2", "1.3"] | None
-    group: Group | None
-    cipher: Cipher | None
-
 VERSION_MAP: dict[str, Literal["1.0", "1.1", "1.2", "1.3"]] = {
     "TLSv1":   "1.0",
     "TLSv1.1": "1.1",
@@ -266,19 +259,6 @@ GROUP_MAP: dict[str, Group] = {
 }
 
 CIPHER_MAP: dict[str, Cipher] = {c.value: c for c in Cipher}
-
-def extract_tls_info(ssl_object: ssl.SSLObject | None) -> TLSInfo | None:
-    if ssl_object is None:
-        return None
-    version = VERSION_MAP.get(ssl_object.version() or '')
-    cipher_tuple = ssl_object.cipher()
-    cipher_name = cipher_tuple[0] if cipher_tuple else ''
-    cipher = CIPHER_MAP.get(cipher_name)
-    if hasattr(ssl_object, 'group'):
-        group = GROUP_MAP.get(ssl_object.group())
-    else:
-        group = None
-    return TLSInfo(version=version, cipher=cipher, group=group)
 
 def set_ssl_groups(ctx: ssl.SSLContext, groups: str):
     if hasattr(ctx, 'set_groups'):

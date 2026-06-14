@@ -236,7 +236,7 @@ requires-dist = [
     { name = "h11" },
     { name = "h2" },
     { name = "minify-html" },
-    { name = "puremagic", specifier = ">=1.30" },
+    { name = "puremagic" },
     { name = "qh3" },
     { name = "rcssmin" },
     { name = "rjsmin" },

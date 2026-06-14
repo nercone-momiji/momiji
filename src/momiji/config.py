@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass, field
-from .protocol.tls import Group, Cipher
+from .tls import Group, Cipher
 
 @dataclass
 class Config:
