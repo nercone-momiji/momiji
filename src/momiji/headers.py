@@ -73,7 +73,7 @@ class Cookie:
     def clear(self):
         self.cookies.clear()
 
-    def copy(self) -> Cookie:
+    def copy(self) -> "Cookie":
         new = Cookie()
         new.initial = self.initial.copy()
         new.cookies = self.cookies.copy()
@@ -121,10 +121,10 @@ class CSP:
 
     def append(self, key: str, value: str):
         if key not in self.directives:
-            self.directives[key] = value
+            self.directives[key] = [value]
             self.default = False
         elif isinstance(self.directives.get(key), list):
-            self.directives[key] += value
+            self.directives[key].append(value)
             self.default = False
 
     def remove(self, key: str):

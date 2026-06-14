@@ -19,4 +19,4 @@ class Config:
     certfile: str | None = None
     keyfile:  str | None = None
     ciphers: list[Cipher] = field(default_factory=lambda: [Cipher.ECDHE_ECDSA_AES128_GCM_SHA256, Cipher.ECDHE_ECDSA_AES256_GCM_SHA384, Cipher.ECDHE_ECDSA_CHACHA20_POLY1305])
-    groups: list[Group] = field(default_factory=lambda: [Cipher.X25519MLKEM768, Cipher.SECP384R1MLKEM1024, Cipher.SECP256R1MLKEM768, Cipher.MLKEM1024, Cipher.MLKEM768, Cipher.X25519, Cipher.prime256v1, Cipher.secp384r1])
+    groups: list[Group] = field(default_factory=lambda: [Group.X25519MLKEM768, Group.SECP384R1MLKEM1024, Group.SECP256R1MLKEM768, Group.MLKEM1024, Group.MLKEM768, Group.X25519, Group.prime256v1, Group.secp384r1])

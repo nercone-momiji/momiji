@@ -1,5 +1,5 @@
 from .config import Config
-from .protocols.http import Request, Response
+from .protocol.http import Request, Response
 
 class App:
     def __init__(self, config: Config):
