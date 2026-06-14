@@ -1,6 +1,5 @@
 import ssl
 import ctypes
-import ctypes.util
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
@@ -264,11 +263,8 @@ def set_ssl_groups(ctx: ssl.SSLContext, groups: str):
     if hasattr(ctx, 'set_groups'):
         ctx.set_groups(groups)
         return
-    libssl_name = ctypes.util.find_library('ssl')
-    if not libssl_name:
-        return
     try:
-        libssl = ctypes.CDLL(libssl_name)
+        libssl = ctypes.CDLL(None)
         libssl.SSL_CTX_set1_groups_list.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         libssl.SSL_CTX_set1_groups_list.restype = ctypes.c_int
         ptr_size = ctypes.sizeof(ctypes.c_void_p)
