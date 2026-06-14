@@ -14,9 +14,9 @@ class Request:
 
 @dataclass
 class Response:
-    body: bytes | os.PathLike | None
     status_code: int = 200
     headers: dict[str,str] = {}
+    body: bytes | os.PathLike | None = None
 
 class App:
     def __init__(self, config: Config):
