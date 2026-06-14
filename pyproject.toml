@@ -15,6 +15,13 @@ dependencies = [
     "h2",
     "qh3",
     "uvloop",
+    "async-lru",
+
+    "minify-html",
+    "rcssmin",
+    "rjsmin",
+    "scour",
+
     "zstandard",
     "brotlicffi"
 ]

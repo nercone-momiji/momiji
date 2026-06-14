@@ -1,13 +1,8 @@
 from __future__ import annotations
 
-import os
-import gzip
-import zlib
 import asyncio
-import functools
 import ipaddress
-import zstandard
-import brotlicffi
+from async_lru import alru_cache
 from typing import TYPE_CHECKING, Iterable, Literal
 from dataclasses import dataclass, field
 
@@ -15,6 +10,16 @@ import h11
 from h2.connection import H2Connection
 from h2.config import H2Configuration
 from h2.events import ConnectionTerminated, DataReceived, RequestReceived, StreamEnded
+
+import gzip
+import zlib
+import zstandard
+import brotlicffi
+
+import minify_html as rhtmin
+import rjsmin
+import rcssmin
+from scour import scour
 
 from .tls import TLSInfo, extract_tls_info
 
@@ -39,24 +44,58 @@ class Request:
 
 @dataclass
 class Response:
-    body: bytes | os.PathLike | None = None
+    body: bytes | None = None
     status_code: int = 200
     headers: dict[str, str] = field(default_factory=dict)
-    compression: bool = True
 
-@functools.lru_cache(maxsize=128)
+    compression: bool = True
+    minification: bool = False
+
+@alru_cache(maxsize=128)
+async def minimize_html(body: bytes) -> bytes:
+    return rhtmin.minify(body.decode("utf-8", errors="replace"), minify_js=True, minify_css=True, keep_comments=True, keep_html_and_head_opening_tags=True).encode("utf-8")
+
+@alru_cache(maxsize=128)
+async def minimize_css(body: bytes) -> bytes:
+    return rcssmin.cssmin(body.decode("utf-8", errors="replace")).encode("utf-8")
+
+@alru_cache(maxsize=128)
+async def minimize_js(body: bytes) -> bytes:
+    return rjsmin.jsmin(body.decode("utf-8", errors="replace")).encode("utf-8")
+
+@alru_cache(maxsize=64)
+async def minimize_svg(body: bytes) -> bytes:
+    scour_options = scour.generateDefaultOptions()
+    scour_options.newlines = False
+    scour_options.shorten_ids = True
+    scour_options.strip_comments = True
+    return scour.scourString(body.decode("utf-8", errors="replace"), scour_options).encode("utf-8")
+
+async def minimize(type: str, body: bytes) -> bytes | None:
+    if type.startswith("text/html"):
+        return await minimize_html(body)
+    elif type.startswith("text/css"):
+        return await minimize_css(body)
+    elif type.startswith(("text/javascript", "application/javascript")):
+        return await minimize_js(body)
+    elif type.startswith("image/svg"):
+        return await minimize_svg(body)
+    else:
+        return None
+
+@alru_cache(maxsize=128)
 async def compress_zstd(body: bytes) -> bytes:
     return zstandard.ZstdCompressor(level=3).compress(body)
 
-@functools.lru_cache(maxsize=128)
+@alru_cache(maxsize=128)
 async def compress_brotli(body: bytes) -> bytes:
     return brotlicffi.compress(body, quality=4)
 
-@functools.lru_cache(maxsize=128)
+@alru_cache(maxsize=128)
 async def compress_gzip(body: bytes) -> bytes:
     return gzip.compress(body, compresslevel=6)
 
-@functools.lru_cache(maxsize=128)
+@alru_cache(maxsize=128)
 async def compress_deflate(body: bytes) -> bytes:
     return zlib.compress(body, level=6)
 
@@ -81,16 +120,25 @@ async def process(app: App, request: Request) -> Response:
         if override or key.lower() not in response.headers:
             response.headers[key.lower()] = value
 
+    minimized = False
+    if response.minification:
+        content_type = response.headers.get("content-type", "")
+        if minimized_body := await minimize(content_type, response.body):
+            minimized = True
+            response.body = minimized_body
+
     compressed = False
     if response.compression:
         for encoding in ["zstd", "br", "gzip", "deflate"]:
+            if not encoding in response.headers.get("content-type", "").split(", "):
+                continue
             compressed = True
             response.body = await compress(encoding, response.body)
             set_header("Content-Encoding", encoding, True)
 
-    set_header("Content-Length", str(len(response.body)), compressed)
+    set_header("Content-Length", str(len(response.body)), minimized or compressed)
 
-    set_header("Server",       "Momiji")
+    set_header("Server", "Momiji")
     set_header("X-Powered-By", "Momiji")
 
     return response
