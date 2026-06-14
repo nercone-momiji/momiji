@@ -14,7 +14,9 @@ dependencies = [
     "h11",
     "h2",
     "qh3",
-    "uvloop"
+    "uvloop",
+    "zstandard",
+    "brotlicffi"
 ]
 classifiers = [
     "Programming Language :: Python :: 3",

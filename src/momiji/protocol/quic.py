@@ -10,7 +10,7 @@ from qh3.h3.events import DataReceived as H3DataReceived, HeadersReceived
 from qh3.quic.configuration import QuicConfiguration
 from qh3.quic.events import ProtocolNegotiated, StreamDataReceived, StreamReset
 
-from .http import Request, build_response_headers, parse_pseudo_headers, process
+from .http import Request, process, parse_pseudo_headers
 
 if TYPE_CHECKING:
     from ..app import App
@@ -105,12 +105,12 @@ class HTTP3Protocol(QuicConnectionProtocol):
             tls=None,
             quic=QUICInfo(connection_id=self.cid, stream_id=stream_id)
         )
-        response, body = await process(self.app, request)
+        response = await process(self.app, request)
 
-        resp_headers = [(b':status', str(response.status_code).encode()), *((k.encode(), v.encode()) for k, v in build_response_headers(response, body))]
+        resp_headers = [(b':status', str(response.status_code).encode()), *((k.encode(), v.encode()) for k, v in list(response.headers.items()))]
 
         self.http.send_headers(stream_id=stream_id, headers=resp_headers)
-        self.http.send_data(stream_id=stream_id, data=body, end_stream=True)
+        self.http.send_data(stream_id=stream_id, data=response.body, end_stream=True)
         self.transmit()
 
 class QUICServer:

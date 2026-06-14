@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import os
+import gzip
+import zlib
 import asyncio
+import functools
 import ipaddress
+import zstandard
+import brotlicffi
 from typing import TYPE_CHECKING, Iterable, Literal
 from dataclasses import dataclass, field
 
@@ -37,6 +42,7 @@ class Response:
     body: bytes | os.PathLike | None = None
     status_code: int = 200
     headers: dict[str, str] = field(default_factory=dict)
+    compression: bool = True
 
 def parse_peername(addr) -> tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int]:
     if not addr or len(addr) < 2:
@@ -45,6 +51,32 @@ def parse_peername(addr) -> tuple[ipaddress.IPv4Address | ipaddress.IPv6Address,
         return ipaddress.ip_address(str(addr[0]).split('%')[0]), int(addr[1])
     except (ValueError, IndexError):
         return ipaddress.IPv4Address('127.0.0.1'), 0
+
+@functools.lru_cache(maxsize=128)
+async def compress_zstd(body: bytes) -> bytes:
+    return zstandard.ZstdCompressor(level=3).compress(body)
+
+@functools.lru_cache(maxsize=128)
+async def compress_brotli(body: bytes) -> bytes:
+    return brotlicffi.compress(body, quality=4)
+
+@functools.lru_cache(maxsize=128)
+async def compress_gzip(body: bytes) -> bytes:
+    return gzip.compress(body, compresslevel=6)
+
+@functools.lru_cache(maxsize=128)
+async def compress_deflate(body: bytes) -> bytes:
+    return zlib.compress(body, level=6)
+
+async def compress(type: Literal["zstd", "br", "gzip", "deflate"], body: bytes) -> bytes:
+    if type == "zstd":
+        return await compress_zstd(body)
+    elif type == "br":
+        return await compress_brotli(body)
+    elif type == "gzip":
+        return await compress_gzip(body)
+    elif type == "deflate":
+        return await compress_deflate(body)
 
 def parse_pseudo_headers(raw_headers: Iterable[tuple]) -> tuple[str, str, dict[str, str]]:
     method = 'GET'
@@ -61,31 +93,30 @@ def parse_pseudo_headers(raw_headers: Iterable[tuple]) -> tuple[str, str, dict[s
             headers[k] = v
     return method, path, headers
 
-async def get_response_body(response: Response) -> bytes:
-    if response.body is None:
-        return b''
-    if isinstance(response.body, bytes):
-        return response.body
-    path = response.body
-    def read():
-        with open(path, 'rb') as f:
-            return f.read()
-    return await asyncio.to_thread(read)
-
-async def process(app: App, request: Request) -> tuple[Response, bytes]:
+async def process(app: App, request: Request) -> Response:
     try:
         response = app(request)
-        body = await get_response_body(response)
+        response.headers = {k.lower(): v for k, v in response.headers.items()}
     except Exception:
         response = Response(b"Internal Server Error", status_code=500)
-        body = b"Internal Server Error"
-    return response, body
 
-def build_response_headers(response: Response, body: bytes) -> list[tuple[str, str]]:
-    headers = list(response.headers.items())
-    if not any(k.lower() == 'content-length' for k, _ in headers):
-        headers.append(('content-length', str(len(body))))
-    return headers
+    def set_header(key: str, value: str, override: bool = False):
+        if override or key.lower() not in response.headers:
+            response.headers[key.lower()] = value
+
+    compressed = False
+    if response.compression:
+        for encoding in ["zstd", "br", "gzip", "deflate"]:
+            compressed = True
+            response.body = await compress(encoding, response.body)
+            set_header("Content-Encoding", encoding, True)
+
+    set_header("Content-Length", str(len(response.body)), compressed)
+
+    set_header("Server",       "Momiji")
+    set_header("X-Powered-By", "Momiji")
+
+    return response
 
 async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, app: App):
     connection = h11.Connection(our_role=h11.SERVER)
@@ -99,7 +130,7 @@ async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         while True:
             method: str | None = None
             target: str | None = None
-            headers: dict[str, str] | None = None
+            request_headers: dict[str, str] | None = None
             body_chunks: list[bytes] = []
 
             while True:
@@ -117,7 +148,7 @@ async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 elif isinstance(event, h11.Request):
                     method = event.method.decode()
                     target = event.target.decode()
-                    headers = {k.decode().lower(): v.decode() for k, v in event.headers}
+                    request_headers = {k.decode().lower(): v.decode() for k, v in event.headers}
 
                 elif isinstance(event, h11.Data):
                     body_chunks.append(event.data)
@@ -133,16 +164,16 @@ async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         protocol='HTTP/1.1',
                         method=method,
                         target=target or '/',
-                        headers=headers or {},
+                        headers=request_headers or {},
                         body=b''.join(body_chunks) or None,
                         tls=tls,
                         quic=None
                     )
-                    response, body = await process(app, request)
+                    response = await process(app, request)
 
-                    out = connection.send(h11.Response(status_code=response.status_code, headers=build_response_headers(response, body)))
-                    if body:
-                        out += connection.send(h11.Data(data=body))
+                    out = connection.send(h11.Response(status_code=response.status_code, headers=list(response.headers.items())))
+                    if response.body:
+                        out += connection.send(h11.Data(data=response.body))
                     out += connection.send(h11.EndOfMessage())
                     writer.write(out)
                     await writer.drain()
@@ -169,12 +200,11 @@ async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             pass
 
 async def respond_http2(conn: H2Connection, writer: asyncio.StreamWriter, lock: asyncio.Lock, stream_id: int, request: Request, app: App):
-    response, body = await process(app, request)
-    resp_headers = [(':status', str(response.status_code)), *build_response_headers(response, body)]
+    response = await process(app, request)
 
     async with lock:
-        conn.send_headers(stream_id=stream_id, headers=resp_headers)
-        conn.send_data(stream_id=stream_id, data=body, end_stream=True)
+        conn.send_headers(stream_id=stream_id, headers=list(response.headers.items()))
+        conn.send_data(stream_id=stream_id, data=response.body, end_stream=True)
         to_send = conn.data_to_send()
         if to_send:
             writer.write(to_send)
