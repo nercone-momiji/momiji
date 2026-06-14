@@ -1,16 +1,16 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 @dataclass
 class Config:
     workers: int = 0
 
     # Protocols
-    alpn_protocols = ["h3", "h2", "http/1.1"]
+    alpn_protocols: list[str] = field(default_factory=lambda: ["h3", "h2", "http/1.1"])
 
     # Ports
-    bind_http:  list[str] = ["0.0.0.0:80",  "[::]:80"]
-    bind_https: list[str] = []
-    bind_quic:  list[str] = []
+    bind_http:  list[str] = field(default_factory=lambda: ["0.0.0.0:80", "[::]:80"])
+    bind_https: list[str] = field(default_factory=list)
+    bind_quic:  list[str] = field(default_factory=list)
 
     # SSL/TLS
     certfile: str | None = None

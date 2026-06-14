@@ -14,11 +14,9 @@ class Request:
 
 @dataclass
 class Response:
-    protocol: Literal["HTTP/0.9", "HTTP/1.0", "HTTP/1.1", "HTTP/2.0", "HTTP/3.0"] | None = None
-    status_code: int = 200
-    status_text: str | None = None
     headers: dict[str,str]
     body: bytes | os.PathLike | None
+    status_code: int = 200
 
 class App:
     def __init__(self, config: Config):

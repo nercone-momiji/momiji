@@ -74,7 +74,10 @@ class Cookie:
         self.cookies.clear()
 
     def copy(self) -> Cookie:
-        return Cookie(self.cookies.copy())
+        new = Cookie()
+        new.initial = self.initial.copy()
+        new.cookies = self.cookies.copy()
+        return new
 
     def headers(self) -> list[str]:
         result: list[str] = []
@@ -133,8 +136,6 @@ class CSP:
         for key, value in self.directives.items():
             if isinstance(value, bool) and value:
                 parts.append(key)
-            elif isinstance(value, str) and value:
-                parts.append(f"{key} {value}")
             elif isinstance(value, list) and len(value) > 0:
                 parts.append(f"{key} {' '.join(value)}")
         return "; ".join(parts).strip()
@@ -200,8 +201,9 @@ class CacheControl:
     def header(self) -> str:
         parts = []
         for key, value in self.directives.items():
-            if value is True:
-                parts.append(key)
+            if isinstance(value, bool):
+                if value:
+                    parts.append(key)
             elif isinstance(value, int):
                 parts.append(f"{key}={value}")
         return ", ".join(parts)
@@ -222,7 +224,8 @@ class ServerTiming:
 
     def stop(self, key: str, description: str | None = None) -> float:
         candidates = [k for k in self.timings if k == key or (k.startswith(f"{key}-") and k[len(key) + 1:].isdigit())]
-        assert candidates
+        if not candidates:
+            raise KeyError(f"No active timing for key {key!r}")
         key = max(candidates, key=lambda k: self.timings[k][0])
         now = time.perf_counter()
         self.timings[key] = [self.timings[key][0], now, description or self.timings[key][2]]
