@@ -116,19 +116,20 @@ class CSP:
 
     def set(self, key: str, value: list[str] | bool, override: bool = True):
         if override or key not in self.directives:
-            self.default = False
             self.directives[key] = value
+            self.default = False
 
-    def append(self, key: str, *values: str):
-        self.default = False
+    def append(self, key: str, value: str):
         if key not in self.directives:
-            self.directives[key] = list(values)
-        else:
-            self.directives[key] += list(values)
+            self.directives[key] = value
+            self.default = False
+        elif isinstance(self.directives.get(key), list):
+            self.directives[key] += value
+            self.default = False
 
     def remove(self, key: str):
-        self.default = False
         self.directives.pop(key, None)
+        self.default = False
 
     @property
     def header(self) -> str:
@@ -223,7 +224,7 @@ class ServerTiming:
         return now
 
     def stop(self, key: str, description: str | None = None) -> float:
-        candidates = [k for k in self.timings if k == key or (k.startswith(f"{key}-") and k[len(key) + 1:].isdigit())]
+        candidates = [k for k in self.timings if (k == key or (k.startswith(f"{key}-") and k[len(key) + 1:].isdigit())) and self.timings[k][1] is None]
         if not candidates:
             raise KeyError(f"No active timing for key {key!r}")
         key = max(candidates, key=lambda k: self.timings[k][0])
@@ -234,7 +235,7 @@ class ServerTiming:
     @property
     def header(self) -> str:
         headers = []
-        sorted_timings = sorted(((key, value) for key, value in self.timings.items() if value[1] is not None), key=lambda item: item[1][1])
+        sorted_timings = sorted(((key, value) for key, value in self.timings.items() if value[1] is not None), key=lambda item: item[1][0])
         for key, value in sorted_timings:
             duration = round((value[1] - value[0]) * 1000, 3)
             headers.append(f"{key}{f';desc=\"{value[2]}\"' if value[2] is not None else ''};dur={duration}")

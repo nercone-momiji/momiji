@@ -14,13 +14,13 @@ class Request:
 
 @dataclass
 class Response:
-    headers: dict[str,str]
     body: bytes | os.PathLike | None
     status_code: int = 200
+    headers: dict[str,str] = {}
 
 class App:
     def __init__(self, config: Config):
         pass
 
     def __call__(self, request: Request) -> Response:
-        pass
+        return Response("Hello, World! This is Response from Default Momiji Application.".encode())
