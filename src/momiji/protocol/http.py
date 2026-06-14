@@ -11,7 +11,7 @@ from h2.connection import H2Connection
 from h2.config import H2Configuration
 from h2.events import ConnectionTerminated, DataReceived, RequestReceived, StreamEnded
 
-from .tls import TLSInfo
+from .tls import TLSInfo, extract_tls_info
 
 if TYPE_CHECKING:
     from ..app import App
@@ -101,7 +101,7 @@ async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                             target=target or '/',
                             headers=headers or {},
                             body=b''.join(body_chunks) or None,
-                            tls=None,
+                            tls=extract_tls_info(ssl_object),
                             quic=None
                         )
 
@@ -144,7 +144,7 @@ async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         except Exception:
             pass
 
-async def respond_h2(conn: H2Connection, writer: asyncio.StreamWriter, lock: asyncio.Lock, stream_id: int, stream_data: dict, app, client_ip: ipaddress.IPv4Address | ipaddress.IPv6Address, client_port: int) -> None:
+async def respond_h2(conn: H2Connection, writer: asyncio.StreamWriter, lock: asyncio.Lock, stream_id: int, stream_data: dict, app, client_ip: ipaddress.IPv4Address | ipaddress.IPv6Address, client_port: int, tls: TLSInfo | None = None) -> None:
     try:
         request = Request(
             client=(client_ip, client_port),
@@ -155,7 +155,7 @@ async def respond_h2(conn: H2Connection, writer: asyncio.StreamWriter, lock: asy
             target=stream_data['path'],
             headers=stream_data['headers'],
             body=stream_data['body'] or None,
-            tls=None,
+            tls=tls,
             quic=None
         )
         response = app(request)
@@ -179,6 +179,7 @@ async def respond_h2(conn: H2Connection, writer: asyncio.StreamWriter, lock: asy
 
 async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, app: App) -> None:
     client_ip, client_port = parse_peername(writer.get_extra_info('peername'))
+    tls_info = extract_tls_info(writer.get_extra_info('ssl_object'))
 
     config = H2Configuration(client_side=False, header_encoding='utf-8')
     connection = H2Connection(config=config)
@@ -240,7 +241,7 @@ async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 
             for sid in pending:
                 if sid in streams:
-                    t = asyncio.create_task(respond_h2(connection, writer, lock, sid, streams.pop(sid), app, client_ip, client_port))
+                    t = asyncio.create_task(respond_h2(connection, writer, lock, sid, streams.pop(sid), app, client_ip, client_port, tls_info))
                     tasks.append(t)
 
     except Exception:

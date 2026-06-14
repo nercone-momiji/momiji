@@ -41,9 +41,46 @@ class Cipher(Enum):
 
 @dataclass
 class TLSInfo:
-    version: Literal["1.0", "1.1", "1.2", "1.3"]
-    group: Group
-    cipher: Cipher
+    version: Literal["1.0", "1.1", "1.2", "1.3"] | None
+    group: Group | None
+    cipher: Cipher | None
+
+VERSION_MAP: dict[str, Literal["1.0", "1.1", "1.2", "1.3"]] = {
+    "TLSv1":   "1.0",
+    "TLSv1.1": "1.1",
+    "TLSv1.2": "1.2",
+    "TLSv1.3": "1.3"
+}
+
+GROUP_MAP: dict[str, Group] = {
+    "x25519":             Group.X25519,
+    "X25519":             Group.X25519,
+    "prime256v1":         Group.prime256v1,
+    "P-256":              Group.prime256v1,
+    "secp384r1":          Group.secp384r1,
+    "P-384":              Group.secp384r1,
+    "secp521r1":          Group.secp521r1,
+    "P-521":              Group.secp521r1,
+    "MLKEM512":           Group.MLKEM512,
+    "MLKEM768":           Group.MLKEM768,
+    "MLKEM1024":          Group.MLKEM1024,
+    "X25519MLKEM768":     Group.X25519MLKEM768,
+    "SecP256r1MLKEM768":  Group.SECP256R1MLKEM768,
+    "SecP384r1MLKEM1024": Group.SECP384R1MLKEM1024
+}
+
+def extract_tls_info(ssl_object: ssl.SSLObject | None) -> TLSInfo:
+    if ssl_object is None:
+        return None
+    version = VERSION_MAP.get(ssl_object.version() or '')
+    cipher_tuple = ssl_object.cipher()
+    cipher_name = cipher_tuple[0] if cipher_tuple else ''
+    cipher = next((c for c in Cipher if c.value == cipher_name), None)
+    if hasattr(ssl_object, 'group'):
+        group = GROUP_MAP.get(ssl_object.group())
+    else:
+        group = None
+    return TLSInfo(version=version, cipher=cipher, group=group)
 
 def set_ssl_groups(ctx: ssl.SSLContext, groups: str) -> None:
     if hasattr(ctx, 'set_groups'):
