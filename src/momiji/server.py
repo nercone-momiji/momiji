@@ -9,3 +9,6 @@ class Server:
 
     def run(self):
         ...
+
+    def serve(self):
+        ...

@@ -1,4 +1,6 @@
+import os
 from dataclasses import dataclass, field
+from .protocol.tls import Group, Cipher
 
 @dataclass
 class Config:
@@ -8,6 +10,7 @@ class Config:
     alpn_protocols: list[str] = field(default_factory=lambda: ["h3", "h2", "http/1.1"])
 
     # Ports
+    bind_unix:  list[os.PathLike] = field(default_factory=list)
     bind_http:  list[str] = field(default_factory=lambda: ["127.0.0.1:80", "[::1]:80"])
     bind_https: list[str] = field(default_factory=list)
     bind_quic:  list[str] = field(default_factory=list)
@@ -15,5 +18,5 @@ class Config:
     # SSL/TLS
     certfile: str | None = None
     keyfile:  str | None = None
-    ciphers: str = "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305"
-    groups:  str = "X25519MLKEM768:SECP384R1MLKEM1024:SECP256R1MLKEM768:MLKEM1024:MLKEM768:X25519:prime256v1:secp384r1"
+    ciphers: list[Cipher] = field(default_factory=lambda: [Cipher.ECDHE_ECDSA_AES128_GCM_SHA256, Cipher.ECDHE_ECDSA_AES256_GCM_SHA384, Cipher.ECDHE_ECDSA_CHACHA20_POLY1305])
+    groups: list[Group] = field(default_factory=lambda: [Cipher.X25519MLKEM768, Cipher.SECP384R1MLKEM1024, Cipher.SECP256R1MLKEM768, Cipher.MLKEM1024, Cipher.MLKEM768, Cipher.X25519, Cipher.prime256v1, Cipher.secp384r1])
