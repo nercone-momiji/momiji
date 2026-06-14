@@ -20,6 +20,25 @@ def parse_host_port(addr: str) -> tuple[str, int]:
         port = int(port_str)
     return host, port
 
+def make_unix_socket(path: os.PathLike) -> socket.socket:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        os.unlink(str(path))
+    except FileNotFoundError:
+        pass
+    s.bind(str(path))
+    return s
+
+def make_tcp_socket(host: str, port: int) -> socket.socket:
+    af = socket.AF_INET6 if ':' in host else socket.AF_INET
+    s = socket.socket(af, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if hasattr(socket, 'SO_REUSEPORT'):
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    s.bind((host, port))
+    return s
+
 class Server:
     def __init__(self, app: type[App] | App, config: Config | None = None):
         if config is None:
@@ -27,49 +46,13 @@ class Server:
         self.config = config
         self.app = app(config) if isinstance(app, type) else app
 
-    def run(self) -> None:
+    def run(self):
         if self.config.workers <= 0:
             uvloop.run(self.serve())
             return
         self.run_workers()
 
-    def bind_sockets(self) -> list[tuple[str, socket.socket]]:
-        bound: list[tuple[str, socket.socket]] = []
-
-        for path in self.config.bind_unix:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                os.unlink(str(path))
-            except FileNotFoundError:
-                pass
-            s.bind(str(path))
-            bound.append(('unix', s))
-
-        for addr in self.config.bind_http:
-            host, port = parse_host_port(addr)
-            af = socket.AF_INET6 if ':' in host else socket.AF_INET
-            s = socket.socket(af, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            if hasattr(socket, 'SO_REUSEPORT'):
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-            s.bind((host, port))
-            bound.append(('http', s))
-
-        if self.config.certfile:
-            for addr in self.config.bind_https:
-                host, port = parse_host_port(addr)
-                af = socket.AF_INET6 if ':' in host else socket.AF_INET
-                s = socket.socket(af, socket.SOCK_STREAM)
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                if hasattr(socket, 'SO_REUSEPORT'):
-                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-                s.bind((host, port))
-                bound.append(('https', s))
-
-        return bound
-
-    def run_workers(self) -> None:
+    def run_workers(self):
         bound = self.bind_sockets()
         pids: set[int] = set()
 
@@ -102,7 +85,27 @@ class Server:
                 except Exception:
                     pass
 
-    async def serve_prebound(self, bound: list[tuple[str, socket.socket]]) -> None:
+    def bind_sockets(self) -> list[tuple[str, socket.socket]]:
+        bound: list[tuple[str, socket.socket]] = []
+
+        for path in self.config.bind_unix:
+            bound.append(('unix', make_unix_socket(path)))
+
+        for addr in self.config.bind_http:
+            host, port = parse_host_port(addr)
+            bound.append(('http', make_tcp_socket(host, port)))
+
+        if self.config.certfile:
+            for addr in self.config.bind_https:
+                host, port = parse_host_port(addr)
+                bound.append(('https', make_tcp_socket(host, port)))
+
+        return bound
+
+    async def serve(self):
+        await self.serve_prebound(self.bind_sockets())
+
+    async def serve_prebound(self, bound: list[tuple[str, socket.socket]]):
         servers: list[asyncio.Server] = []
         quic_servers: list[QUICServer] = []
 
@@ -130,40 +133,6 @@ class Server:
             for addr in self.config.bind_quic:
                 host, port = parse_host_port(addr)
                 quic_servers.append(QUICServer(self.app, self.config, host, port))
-
-        if not servers and not quic_servers:
-            return
-
-        await asyncio.gather(*[s.serve_forever() for s in servers], *[qs.run() for qs in quic_servers])
-
-    async def serve(self) -> None:
-        servers: list[asyncio.Server] = []
-        quic_servers: list[QUICServer] = []
-
-        http11_handler = lambda r, w: handle_http11(r, w, self.app)
-        https_handler = lambda r, w: handle_https(r, w, self.app)
-
-        for path in self.config.bind_unix:
-            server = await asyncio.start_unix_server(http11_handler, path=str(path), backlog=1024)
-            servers.append(server)
-
-        for addr in self.config.bind_http:
-            host, port = parse_host_port(addr)
-            server = await asyncio.start_server(http11_handler, host, port, backlog=1024)
-            servers.append(server)
-
-        if self.config.certfile:
-            if self.config.bind_https:
-                ssl_ctx = create_ssl_context(self.config)
-                for addr in self.config.bind_https:
-                    host, port = parse_host_port(addr)
-                    server = await asyncio.start_server(https_handler, host, port, ssl=ssl_ctx, backlog=1024)
-                    servers.append(server)
-
-            if self.config.bind_quic:
-                for addr in self.config.bind_quic:
-                    host, port = parse_host_port(addr)
-                    quic_servers.append(QUICServer(self.app, self.config, host, port))
 
         if not servers and not quic_servers:
             return

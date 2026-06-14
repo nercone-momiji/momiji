@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import asyncio
 import ipaddress
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Iterable, Literal
 from dataclasses import dataclass, field
 
 import h11
@@ -46,6 +46,21 @@ def parse_peername(addr) -> tuple[ipaddress.IPv4Address | ipaddress.IPv6Address,
     except (ValueError, IndexError):
         return ipaddress.IPv4Address('127.0.0.1'), 0
 
+def parse_pseudo_headers(raw_headers: Iterable[tuple]) -> tuple[str, str, dict[str, str]]:
+    method = 'GET'
+    path = '/'
+    headers: dict[str, str] = {}
+    for raw_k, raw_v in raw_headers:
+        k = raw_k.decode('latin-1') if isinstance(raw_k, bytes) else raw_k
+        v = raw_v.decode('latin-1') if isinstance(raw_v, bytes) else raw_v
+        if k == ':method':
+            method = v
+        elif k == ':path':
+            path = v
+        elif not k.startswith(':'):
+            headers[k] = v
+    return method, path, headers
+
 async def get_response_body(response: Response) -> bytes:
     if response.body is None:
         return b''
@@ -57,12 +72,28 @@ async def get_response_body(response: Response) -> bytes:
             return f.read()
     return await asyncio.to_thread(read)
 
-async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, app: App) -> None:
+async def process(app: App, request: Request) -> tuple[Response, bytes]:
+    try:
+        response = app(request)
+        body = await get_response_body(response)
+    except Exception:
+        response = Response(b"Internal Server Error", status_code=500)
+        body = b"Internal Server Error"
+    return response, body
+
+def build_response_headers(response: Response, body: bytes) -> list[tuple[str, str]]:
+    headers = list(response.headers.items())
+    if not any(k.lower() == 'content-length' for k, _ in headers):
+        headers.append(('content-length', str(len(body))))
+    return headers
+
+async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, app: App):
     connection = h11.Connection(our_role=h11.SERVER)
-    client_ip, client_port = parse_peername(writer.get_extra_info('peername'))
+    client = parse_peername(writer.get_extra_info('peername'))
     ssl_object = writer.get_extra_info('ssl_object')
     secure = ssl_object is not None
-    scheme: Literal['http', 'https'] = 'https' if secure else 'http'
+    scheme = 'https' if secure else 'http'
+    tls = extract_tls_info(ssl_object)
 
     try:
         while True:
@@ -94,33 +125,22 @@ async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 elif isinstance(event, h11.EndOfMessage):
                     if method is None:
                         return
-                    try:
-                        request = Request(
-                            client=(client_ip, client_port),
-                            scheme=scheme,
-                            secure=secure,
-                            protocol='HTTP/1.1',
-                            method=method,
-                            target=target or '/',
-                            headers=headers or {},
-                            body=b''.join(body_chunks) or None,
-                            tls=extract_tls_info(ssl_object),
-                            quic=None
-                        )
 
-                        response = app(request)
-                        body = await get_response_body(response)
+                    request = Request(
+                        client=client,
+                        scheme=scheme,
+                        secure=secure,
+                        protocol='HTTP/1.1',
+                        method=method,
+                        target=target or '/',
+                        headers=headers or {},
+                        body=b''.join(body_chunks) or None,
+                        tls=tls,
+                        quic=None
+                    )
+                    response, body = await process(app, request)
 
-                    except Exception:
-                        response = Response("Internal Server Error".encode(), status_code=500)
-                        body = b"Internal Server Error"
-
-                    if 'content-length' in response.headers:
-                        headers_list = list(response.headers.items())
-                    else:
-                        headers_list = [*response.headers.items(), ('content-length', str(len(body)))]
-
-                    out = connection.send(h11.Response(status_code=response.status_code, headers=headers_list))
+                    out = connection.send(h11.Response(status_code=response.status_code, headers=build_response_headers(response, body)))
                     if body:
                         out += connection.send(h11.Data(data=body))
                     out += connection.send(h11.EndOfMessage())
@@ -148,28 +168,9 @@ async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         except Exception:
             pass
 
-async def respond_h2(conn: H2Connection, writer: asyncio.StreamWriter, lock: asyncio.Lock, stream_id: int, stream_data: dict, app, client_ip: ipaddress.IPv4Address | ipaddress.IPv6Address, client_port: int, tls: TLSInfo | None = None) -> None:
-    try:
-        request = Request(
-            client=(client_ip, client_port),
-            scheme='https',
-            secure=True,
-            protocol='HTTP/2.0',
-            method=stream_data['method'],
-            target=stream_data['path'],
-            headers=stream_data['headers'],
-            body=bytes(stream_data['body']) if stream_data['body'] else None,
-            tls=tls,
-            quic=None
-        )
-        response = app(request)
-        body = await get_response_body(response)
-
-    except Exception:
-        response = Response("Internal Server Error".encode(), status_code=500)
-        body = b"Internal Server Error"
-
-    resp_headers = [(':status', str(response.status_code)), ('content-length', str(len(body))), *response.headers.items()]
+async def respond_http2(conn: H2Connection, writer: asyncio.StreamWriter, lock: asyncio.Lock, stream_id: int, request: Request, app: App):
+    response, body = await process(app, request)
+    resp_headers = [(':status', str(response.status_code)), *build_response_headers(response, body)]
 
     async with lock:
         conn.send_headers(stream_id=stream_id, headers=resp_headers)
@@ -179,9 +180,9 @@ async def respond_h2(conn: H2Connection, writer: asyncio.StreamWriter, lock: asy
             writer.write(to_send)
     await writer.drain()
 
-async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, app: App) -> None:
-    client_ip, client_port = parse_peername(writer.get_extra_info('peername'))
-    tls_info = extract_tls_info(writer.get_extra_info('ssl_object'))
+async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, app: App):
+    client = parse_peername(writer.get_extra_info('peername'))
+    tls = extract_tls_info(writer.get_extra_info('ssl_object'))
 
     config = H2Configuration(client_side=False, header_encoding='utf-8')
     connection = H2Connection(config=config)
@@ -195,6 +196,24 @@ async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
     streams: dict[int, dict] = {}
     tasks: set[asyncio.Task] = set()
     pending: set[int] = set()
+
+    def dispatch(stream_id: int):
+        stream = streams.pop(stream_id)
+        request = Request(
+            client=client,
+            scheme='https',
+            secure=True,
+            protocol='HTTP/2.0',
+            method=stream['method'],
+            target=stream['path'],
+            headers=stream['headers'],
+            body=bytes(stream['body']) if stream['body'] else None,
+            tls=tls,
+            quic=None
+        )
+        t = asyncio.create_task(respond_http2(connection, writer, lock, stream_id, request, app))
+        tasks.add(t)
+        t.add_done_callback(tasks.discard)
 
     try:
         while True:
@@ -211,16 +230,7 @@ async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                 events = connection.receive_data(data)
                 for event in events:
                     if isinstance(event, RequestReceived):
-                        method = 'GET'
-                        path = '/'
-                        headers: dict[str, str] = {}
-                        for k, v in event.headers:
-                            if k == ':method':
-                                method = v
-                            elif k == ':path':
-                                path = v
-                            elif not k.startswith(':'):
-                                headers[k] = v
+                        method, path, headers = parse_pseudo_headers(event.headers)
                         streams[event.stream_id] = {
                             'method': method,
                             'path': path,
@@ -254,9 +264,7 @@ async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 
             for sid in pending:
                 if sid in streams:
-                    t = asyncio.create_task(respond_h2(connection, writer, lock, sid, streams.pop(sid), app, client_ip, client_port, tls_info))
-                    tasks.add(t)
-                    t.add_done_callback(tasks.discard)
+                    dispatch(sid)
 
     except Exception:
         pass
@@ -271,7 +279,7 @@ async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         except Exception:
             pass
 
-async def handle_https(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, app) -> None:
+async def handle_https(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, app: App):
     ssl_object = writer.get_extra_info('ssl_object')
     if ssl_object is not None and ssl_object.selected_alpn_protocol() == 'h2':
         await handle_http2(reader, writer, app)

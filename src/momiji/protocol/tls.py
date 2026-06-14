@@ -71,7 +71,7 @@ GROUP_MAP: dict[str, Group] = {
 
 CIPHER_MAP: dict[str, Cipher] = {c.value: c for c in Cipher}
 
-def extract_tls_info(ssl_object: ssl.SSLObject | None) -> TLSInfo:
+def extract_tls_info(ssl_object: ssl.SSLObject | None) -> TLSInfo | None:
     if ssl_object is None:
         return None
     version = VERSION_MAP.get(ssl_object.version() or '')
@@ -84,7 +84,7 @@ def extract_tls_info(ssl_object: ssl.SSLObject | None) -> TLSInfo:
         group = None
     return TLSInfo(version=version, cipher=cipher, group=group)
 
-def set_ssl_groups(ctx: ssl.SSLContext, groups: str) -> None:
+def set_ssl_groups(ctx: ssl.SSLContext, groups: str):
     if hasattr(ctx, 'set_groups'):
         ctx.set_groups(groups)
         return
