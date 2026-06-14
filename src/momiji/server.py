@@ -71,7 +71,7 @@ class Server:
 
     def run_workers(self) -> None:
         bound = self.bind_sockets()
-        pids: list[int] = []
+        pids: set[int] = set()
 
         for _ in range(self.config.workers):
             pid = os.fork()
@@ -80,7 +80,7 @@ class Server:
                     uvloop.run(self.serve_prebound(bound))
                 finally:
                     os._exit(0)
-            pids.append(pid)
+            pids.add(pid)
 
         for _, sock in bound:
             sock.close()
@@ -89,7 +89,7 @@ class Server:
             while pids:
                 dead_pid, _ = os.wait()
                 if dead_pid in pids:
-                    pids.remove(dead_pid)
+                    pids.discard(dead_pid)
         except (KeyboardInterrupt, SystemExit):
             for pid in pids:
                 try:

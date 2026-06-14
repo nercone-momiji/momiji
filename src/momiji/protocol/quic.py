@@ -31,6 +31,7 @@ class HTTP3Protocol(QuicConnectionProtocol):
         super().__init__(*args, **kwargs)
         self.http: H3Connection | None = None
         self.streams: dict[int, dict] = {}
+        self.tasks: set[asyncio.Task] = set()
         self.client_ip: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.IPv4Address('127.0.0.1')
         self.client_port: int = 0
         self.cid: bytes = b''
@@ -41,11 +42,11 @@ class HTTP3Protocol(QuicConnectionProtocol):
             return
         self.conn_info_cached = True
         try:
-            self.cid = bytes(self.quic.host_cid)
+            self.cid = bytes(self._quic.host_cid)
         except Exception:
             pass
         try:
-            network_paths = self.quic.network_paths
+            network_paths = self._quic._network_paths
             addr = network_paths[0].addr if network_paths else None
             if addr is not None:
                 self.client_ip = ipaddress.ip_address(str(addr[0]).split('%')[0])
@@ -56,7 +57,7 @@ class HTTP3Protocol(QuicConnectionProtocol):
     def quic_event_received(self, event) -> None:
         if isinstance(event, ProtocolNegotiated):
             if event.alpn_protocol in H3_ALPN:
-                self.http = H3Connection(self.quic)
+                self.http = H3Connection(self._quic)
 
         elif self.http is not None and isinstance(event, (StreamDataReceived, StreamReset)):
             for h3_event in self.http.handle_event(event):
@@ -80,14 +81,23 @@ class HTTP3Protocol(QuicConnectionProtocol):
                         'body': bytearray()
                     }
                     if h3_event.stream_ended:
-                        asyncio.create_task(self.handle_h3_request(h3_event.stream_id))
+                        t = asyncio.create_task(self.handle_h3_request(h3_event.stream_id))
+                        self.tasks.add(t)
+                        t.add_done_callback(self.tasks.discard)
 
                 elif isinstance(h3_event, H3DataReceived):
                     if h3_event.stream_id in self.streams:
                         self.streams[h3_event.stream_id]['body'] += h3_event.data
 
                     if h3_event.stream_ended and h3_event.stream_id in self.streams:
-                        asyncio.create_task(self.handle_h3_request(h3_event.stream_id))
+                        t = asyncio.create_task(self.handle_h3_request(h3_event.stream_id))
+                        self.tasks.add(t)
+                        t.add_done_callback(self.tasks.discard)
+
+    def connection_lost(self, exc) -> None:
+        for t in self.tasks:
+            t.cancel()
+        super().connection_lost(exc)
 
     async def handle_h3_request(self, stream_id: int) -> None:
         if stream_id not in self.streams:
@@ -105,7 +115,7 @@ class HTTP3Protocol(QuicConnectionProtocol):
                 method=stream_data['method'],
                 target=stream_data['path'],
                 headers=stream_data['headers'],
-                body=bytes(stream_data['body']) or None,
+                body=bytes(stream_data['body']) if stream_data['body'] else None,
                 tls=None,
                 quic=QUICInfo(connection_id=self.cid, stream_id=stream_id)
             )

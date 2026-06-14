@@ -115,9 +115,12 @@ async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         response = Response("Internal Server Error".encode(), status_code=500)
                         body = b"Internal Server Error"
 
-                    resp_headers = dict(response.headers)
-                    resp_headers.setdefault('content-length', str(len(body)))
-                    out = connection.send(h11.Response(status_code=response.status_code, headers=list(resp_headers.items())))
+                    if 'content-length' in response.headers:
+                        headers_list = list(response.headers.items())
+                    else:
+                        headers_list = [*response.headers.items(), ('content-length', str(len(body)))]
+
+                    out = connection.send(h11.Response(status_code=response.status_code, headers=headers_list))
                     if body:
                         out += connection.send(h11.Data(data=body))
                     out += connection.send(h11.EndOfMessage())
@@ -155,7 +158,7 @@ async def respond_h2(conn: H2Connection, writer: asyncio.StreamWriter, lock: asy
             method=stream_data['method'],
             target=stream_data['path'],
             headers=stream_data['headers'],
-            body=bytes(stream_data['body']) or None,
+            body=bytes(stream_data['body']) if stream_data['body'] else None,
             tls=tls,
             quic=None
         )
@@ -191,6 +194,7 @@ async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 
     streams: dict[int, dict] = {}
     tasks: set[asyncio.Task] = set()
+    pending: set[int] = set()
 
     try:
         while True:
@@ -201,7 +205,7 @@ async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             if not data:
                 break
 
-            pending: set[int] = set()
+            pending.clear()
 
             async with lock:
                 events = connection.receive_data(data)
