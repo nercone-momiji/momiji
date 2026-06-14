@@ -46,13 +46,13 @@ def parse_peername(addr) -> tuple[ipaddress.IPv4Address | ipaddress.IPv6Address,
     except (ValueError, IndexError):
         return ipaddress.IPv4Address('127.0.0.1'), 0
 
-def get_response_body(response: Response) -> bytes:
+async def get_response_body(response: Response) -> bytes:
     if response.body is None:
         return b''
     if isinstance(response.body, bytes):
         return response.body
-    with open(response.body, 'rb') as f:
-        return f.read()
+    path = response.body
+    return await asyncio.to_thread(lambda: open(path, 'rb').read())
 
 async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, app: App) -> None:
     connection = h11.Connection(our_role=h11.SERVER)
@@ -106,21 +106,17 @@ async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         )
 
                         response = app(request)
-                        body = get_response_body(response)
+                        body = await get_response_body(response)
 
                     except Exception:
                         response = Response("Internal Server Error".encode(), status_code=500)
-                        body = "Internal Server Error".encode()
+                        body = b"Internal Server Error"
 
-                    writer.write(connection.send(h11.Response(
-                        status_code=response.status_code,
-                        headers=list(response.headers.items()),
-                    )))
-
+                    out = connection.send(h11.Response(status_code=response.status_code, headers=list(response.headers.items())))
                     if body:
-                        writer.write(connection.send(h11.Data(data=body)))
-
-                    writer.write(connection.send(h11.EndOfMessage()))
+                        out += connection.send(h11.Data(data=body))
+                    out += connection.send(h11.EndOfMessage())
+                    writer.write(out)
                     await writer.drain()
 
                     if connection.our_state is h11.DONE and connection.their_state is h11.DONE:
@@ -154,20 +150,18 @@ async def respond_h2(conn: H2Connection, writer: asyncio.StreamWriter, lock: asy
             method=stream_data['method'],
             target=stream_data['path'],
             headers=stream_data['headers'],
-            body=stream_data['body'] or None,
+            body=bytes(stream_data['body']) or None,
             tls=tls,
             quic=None
         )
         response = app(request)
-        body = get_response_body(response)
+        body = await get_response_body(response)
 
     except Exception:
         response = Response("Internal Server Error".encode(), status_code=500)
-        body = "Internal Server Error".encode()
+        body = b"Internal Server Error"
 
-    resp_headers = [(':status', str(response.status_code))]
-    resp_headers += list(response.headers.items())
-    resp_headers.append(('content-length', str(len(body))))
+    resp_headers = [(':status', str(response.status_code)), ('content-length', str(len(body))), *response.headers.items()]
 
     async with lock:
         conn.send_headers(stream_id=stream_id, headers=resp_headers)
@@ -191,7 +185,7 @@ async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         await writer.drain()
 
     streams: dict[int, dict] = {}
-    tasks: list[asyncio.Task] = []
+    tasks: set[asyncio.Task] = set()
 
     try:
         while True:
@@ -222,7 +216,7 @@ async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                             'method': method,
                             'path': path,
                             'headers': headers,
-                            'body': b''
+                            'body': bytearray()
                         }
                         if event.stream_ended is not None:
                             pending.append(event.stream_id)
@@ -251,15 +245,15 @@ async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             for sid in pending:
                 if sid in streams:
                     t = asyncio.create_task(respond_h2(connection, writer, lock, sid, streams.pop(sid), app, client_ip, client_port, tls_info))
-                    tasks.append(t)
+                    tasks.add(t)
+                    t.add_done_callback(tasks.discard)
 
     except Exception:
         pass
 
     finally:
         for t in tasks:
-            if not t.done():
-                t.cancel()
+            t.cancel()
 
         try:
             writer.close()

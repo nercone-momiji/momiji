@@ -69,13 +69,15 @@ GROUP_MAP: dict[str, Group] = {
     "SecP384r1MLKEM1024": Group.SECP384R1MLKEM1024
 }
 
+CIPHER_MAP: dict[str, Cipher] = {c.value: c for c in Cipher}
+
 def extract_tls_info(ssl_object: ssl.SSLObject | None) -> TLSInfo:
     if ssl_object is None:
         return None
     version = VERSION_MAP.get(ssl_object.version() or '')
     cipher_tuple = ssl_object.cipher()
     cipher_name = cipher_tuple[0] if cipher_tuple else ''
-    cipher = next((c for c in Cipher if c.value == cipher_name), None)
+    cipher = CIPHER_MAP.get(cipher_name)
     if hasattr(ssl_object, 'group'):
         group = GROUP_MAP.get(ssl_object.group())
     else:

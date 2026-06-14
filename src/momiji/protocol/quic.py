@@ -31,6 +31,27 @@ class HTTP3Protocol(QuicConnectionProtocol):
         super().__init__(*args, **kwargs)
         self.http: H3Connection | None = None
         self.streams: dict[int, dict] = {}
+        self.client_ip: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.IPv4Address('127.0.0.1')
+        self.client_port: int = 0
+        self.cid: bytes = b''
+        self.conn_info_cached: bool = False
+
+    def cache_connection_info(self) -> None:
+        if self.conn_info_cached:
+            return
+        self.conn_info_cached = True
+        try:
+            self.cid = bytes(self.quic.host_cid)
+        except Exception:
+            pass
+        try:
+            network_paths = self.quic.network_paths
+            addr = network_paths[0].addr if network_paths else None
+            if addr is not None:
+                self.client_ip = ipaddress.ip_address(str(addr[0]).split('%')[0])
+                self.client_port = int(addr[1])
+        except Exception:
+            pass
 
     def quic_event_received(self, event) -> None:
         if isinstance(event, ProtocolNegotiated):
@@ -56,7 +77,7 @@ class HTTP3Protocol(QuicConnectionProtocol):
                         'method': method,
                         'path': path,
                         'headers': headers,
-                        'body': b''
+                        'body': bytearray()
                     }
                     if h3_event.stream_ended:
                         asyncio.create_task(self.handle_h3_request(h3_event.stream_id))
@@ -73,42 +94,27 @@ class HTTP3Protocol(QuicConnectionProtocol):
             return
         stream_data = self.streams.pop(stream_id)
 
-        try:
-            network_paths = self.quic.network_paths
-            addr = network_paths[0].addr if network_paths else None
-        except Exception:
-            addr = None
-
-        if addr is None:
-            client_ip, client_port = ipaddress.IPv4Address('127.0.0.1'), 0
-        else:
-            client_ip = ipaddress.ip_address(str(addr[0]).split('%')[0])
-            client_port = int(addr[1])
-
-        try:
-            cid = bytes(self.quic.host_cid)
-        except Exception:
-            cid = b''
+        self.cache_connection_info()
 
         try:
             request = Request(
-                client=(client_ip, client_port),
+                client=(self.client_ip, self.client_port),
                 scheme='https',
                 secure=True,
                 protocol='HTTP/3.0',
                 method=stream_data['method'],
                 target=stream_data['path'],
                 headers=stream_data['headers'],
-                body=stream_data['body'] or None,
+                body=bytes(stream_data['body']) or None,
                 tls=None,
-                quic=QUICInfo(connection_id=cid, stream_id=stream_id)
+                quic=QUICInfo(connection_id=self.cid, stream_id=stream_id)
             )
             response = self.app(request)
-            body = get_response_body(response)
+            body = await get_response_body(response)
 
         except Exception:
             response = Response("Internal Server Error".encode(), status_code=500)
-            body = "Internal Server Error".encode()
+            body = b"Internal Server Error"
 
         resp_headers = [(b':status', str(response.status_code).encode()), (b'content-length', str(len(body)).encode()), *((k.encode(), v.encode()) for k, v in response.headers.items())]
 
