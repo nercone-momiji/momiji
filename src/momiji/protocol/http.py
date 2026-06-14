@@ -44,14 +44,6 @@ class Response:
     headers: dict[str, str] = field(default_factory=dict)
     compression: bool = True
 
-def parse_peername(addr) -> tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int]:
-    if not addr or len(addr) < 2:
-        return ipaddress.IPv4Address('127.0.0.1'), 0
-    try:
-        return ipaddress.ip_address(str(addr[0]).split('%')[0]), int(addr[1])
-    except (ValueError, IndexError):
-        return ipaddress.IPv4Address('127.0.0.1'), 0
-
 @functools.lru_cache(maxsize=128)
 async def compress_zstd(body: bytes) -> bytes:
     return zstandard.ZstdCompressor(level=3).compress(body)
@@ -78,21 +70,6 @@ async def compress(type: Literal["zstd", "br", "gzip", "deflate"], body: bytes) 
     elif type == "deflate":
         return await compress_deflate(body)
 
-def parse_pseudo_headers(raw_headers: Iterable[tuple]) -> tuple[str, str, dict[str, str]]:
-    method = 'GET'
-    path = '/'
-    headers: dict[str, str] = {}
-    for raw_k, raw_v in raw_headers:
-        k = raw_k.decode('latin-1') if isinstance(raw_k, bytes) else raw_k
-        v = raw_v.decode('latin-1') if isinstance(raw_v, bytes) else raw_v
-        if k == ':method':
-            method = v
-        elif k == ':path':
-            path = v
-        elif not k.startswith(':'):
-            headers[k] = v
-    return method, path, headers
-
 async def process(app: App, request: Request) -> Response:
     try:
         response = app(request)
@@ -117,6 +94,29 @@ async def process(app: App, request: Request) -> Response:
     set_header("X-Powered-By", "Momiji")
 
     return response
+
+def parse_peername(addr) -> tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int]:
+    if not addr or len(addr) < 2:
+        return ipaddress.IPv4Address('127.0.0.1'), 0
+    try:
+        return ipaddress.ip_address(str(addr[0]).split('%')[0]), int(addr[1])
+    except (ValueError, IndexError):
+        return ipaddress.IPv4Address('127.0.0.1'), 0
+
+def parse_pseudo_headers(raw_headers: Iterable[tuple]) -> tuple[str, str, dict[str, str]]:
+    method = 'GET'
+    path = '/'
+    headers: dict[str, str] = {}
+    for raw_k, raw_v in raw_headers:
+        k = raw_k.decode('latin-1') if isinstance(raw_k, bytes) else raw_k
+        v = raw_v.decode('latin-1') if isinstance(raw_v, bytes) else raw_v
+        if k == ':method':
+            method = v
+        elif k == ':path':
+            path = v
+        elif not k.startswith(':'):
+            headers[k] = v
+    return method, path, headers
 
 async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, app: App):
     connection = h11.Connection(our_role=h11.SERVER)
