@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import ssl
-import asyncio
+import os
 import ipaddress
-import puremagic
-from async_lru import alru_cache
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Literal
+from async_lru import alru_cache
 from dataclasses import dataclass, field
 
 import gzip
@@ -19,14 +18,14 @@ import rcssmin
 from scour import scour
 
 from .config import Config
-from .tls import Group, Cipher, VERSION_MAP, CIPHER_MAP, GROUP_MAP
+from .tls import Group, Cipher
 
 if TYPE_CHECKING:
     from .app import App
 
 @dataclass
 class TLSInfo:
-    version: Literal["1.0", "1.1", "1.2", "1.3"] | None
+    version: Literal["SSLv3.0", "TLSv1.0", "TLSv1.1", "TLSv1.2", "TLSv1.3"] | None
     group: Group | None
     cipher: Cipher | None
 
@@ -41,7 +40,7 @@ class Request:
     scheme: Literal["http", "https"]
     secure: bool
 
-    protocol: Literal["HTTP/0.9", "HTTP/1.0", "HTTP/1.1", "HTTP/2.0", "HTTP/3.0"]
+    protocol: Literal["HTTP/1.1", "HTTP/2.0", "HTTP/3.0"]
     method: Literal["GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH"]
     target: str
     headers: Headers
@@ -52,12 +51,17 @@ class Request:
 
 @dataclass
 class Response:
-    body: bytes | None = None
+    body: bytes | os.PathLike | None = None
     status_code: int = 200
     headers: Headers = field(default_factory=lambda: Headers({}))
+    protocol: Literal["HTTP/1.1", "HTTP/2.0", "HTTP/3.0"]
 
     compression: bool = True
     minification: bool = False
+
+    @property
+    def has_real_body(self) -> bool:
+        return self.body is not None and isinstance(self.body, bytes)
 
 class Headers:
     def __init__(self, headers: dict[str, str]):
@@ -66,33 +70,29 @@ class Headers:
             self.append(k, v)
 
     def __getitem__(self, key: str) -> str | None:
-        return self.get(key)
+        return self.get(key.lower())
 
     def __setitem__(self, key: str, value: str):
-        self.set(key, value)
+        self.set(key.lower(), value)
 
     def __contains__(self, item: str):
         return item.lower() in self.headers
 
     def get(self, key: str, default=None) -> str | None:
-        if key in self.headers:
+        if key.lower() in self.headers:
             return ", ".join(self.headers.get(key.lower()))
         else:
             return default
-
-    def get_all(self, key: str) -> list[str] | None:
-        return self.headers.get(key.lower())
 
     def set(self, key: str, value: str, override: bool = True):
         if override or key.lower() not in self.headers:
             self.headers[key.lower()] = [value]
 
     def append(self, key: str, value: str):
-        key = key.lower()
-        if key in self.headers:
-            self.headers[key].append(value)
+        if key.lower() in self.headers:
+            self.headers[key.lower()].append(value)
         else:
-            self.headers[key] = [value]
+            self.headers[key.lower()] = [value]
 
     def items(self) -> list[tuple[str, str]]:
         return [(k, v) for k, values in self.headers.items() for v in values]
@@ -133,79 +133,71 @@ async def compress_gzip(body: bytes) -> bytes:
 async def compress_deflate(body: bytes) -> bytes:
     return zlib.compress(body, level=6)
 
-async def minimize(type: str, body: bytes) -> bytes | None:
-    if type.startswith("text/html"):
-        return await minimize_html(body)
-    elif type.startswith("text/css"):
-        return await minimize_css(body)
-    elif type.startswith(("text/javascript", "application/javascript")):
-        return await minimize_js(body)
-    elif type.startswith("image/svg"):
-        return await minimize_svg(body)
-    else:
-        return None
+async def minimize(response: Response) -> bytes | None:
+    if response.has_real_body and response.minification:
+        content_type = response.headers.get("Content-Type", "")
+        if content_type.startswith("text/html"):
+            return await minimize_html(response.body)
+        elif content_type.startswith("text/css"):
+            return await minimize_css(response.body)
+        elif content_type.startswith(("text/javascript", "application/javascript")):
+            return await minimize_js(response.body)
+        elif content_type.startswith("image/svg"):
+            return await minimize_svg(response.body)
+        else:
+            return None
 
-async def compress(type: str, body: bytes) -> bytes | None:
-    if type == "zstd":
-        return await compress_zstd(body)
-    elif type == "br":
-        return await compress_brotli(body)
-    elif type == "gzip":
-        return await compress_gzip(body)
-    elif type == "deflate":
-        return await compress_deflate(body)
-    else:
-        return None
+async def compress(response: Response, accepted_encodings: str = "") -> bytes | None:
+    if response.has_real_body and response.compression and accepted_encodings:
+        for encoding in ["zstd", "br", "gzip", "deflate"]:
+            if not encoding in accepted_encodings:
+                continue
 
-def sniff_content_type(body: bytes) -> str:
-    try:
-        mime = puremagic.from_string(body, mime=True)
-    except puremagic.PureError:
-        try:
-            body.decode("utf-8")
-            mime = "text/plain"
-        except UnicodeDecodeError:
-            mime = "application/octet-stream"
-    if mime.startswith("text/") and "charset" not in mime:
-        mime += "; charset=utf-8"
-    return mime
+            response.headers.set("Content-Encoding", encoding)
+
+            if encoding == "zstd":
+                return await compress_zstd(response.body)
+            elif encoding == "br":
+                return await compress_brotli(response.body)
+            elif encoding == "gzip":
+                return await compress_gzip(response.body)
+            elif encoding == "deflate":
+                return await compress_deflate(response.body)
+            else:
+                return None
 
 async def process(app: App, request: Request) -> Response:
     try:
         response = app(request)
+        response.protocol = response.protocol or request.protocol
     except Exception:
-        response = Response(b"Internal Server Error", status_code=500)
+        response = Response(b"Internal Server Error", status_code=500, compression=False, minification=False, protocol=request.protocol)
 
     response.headers.set("Server", "Momiji", override=False)
 
-    if response.body:
-        response.headers.set("content-type", sniff_content_type(response.body), override=False)
+    if response.has_real_body:
+        response.body = await minimize(response) or response.body
+        response.body = await compress(response, request.headers.get("accept-encoding", "")) or response.body
 
-        minimized = False
-        if response.minification:
-            content_type = response.headers.get("content-type", "")
-            if minimized_body := await minimize(content_type, response.body):
-                minimized = True
-                response.body = minimized_body
-
-        compressed = False
-        if response.compression:
-            for encoding in ["zstd", "br", "gzip", "deflate"]:
-                if not encoding in request.headers.get("accept-encoding", "").split(", "):
-                    continue
-                compressed = True
-                response.body = await compress(encoding, response.body)
-                response.headers.set("Content-Encoding", encoding)
-
-    response.headers.set("Content-Length", str(len(response.body) if response.body else 0), override=minimized or compressed)
+        response.headers.set("Content-Type", "application/octet-stream", override=False)
+        response.headers.set("Content-Length", str(len(response.body)))
 
     return response
 
 async def parse(request: bytes) -> Request:
     ...
 
-async def build(response: Response) -> bytes:
-    ...
+async def build(response: Response) -> bytes | tuple[bytes, os.PathLike]:
+    if response.protocol == "HTTP/1.1":
+        built = f"{response.protocol} {response.status_code} {HTTPStatus(response.status_code).phrase}\n"
+        for key, value in response.headers.items():
+            built += f"{key.strip()}: {value}\n"
+        built += "\n"
 
-async def handle(app: App, config: Config, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if response.has_real_body:
+            return built.encode("latin-1") + response.body
+        else:
+            return built.encode("latin-1"), response.body
+
+async def handle(app: App, config: Config) -> None:
     ...
