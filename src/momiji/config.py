@@ -8,7 +8,7 @@ class Config:
     alpn_protocols: list[str] = field(default_factory=lambda: ["h3", "h2", "http/1.1"])
 
     # Ports
-    bind_http:  list[str] = field(default_factory=lambda: ["0.0.0.0:80", "[::]:80"])
+    bind_http:  list[str] = field(default_factory=lambda: ["127.0.0.1:80", "[::1]:80"])
     bind_https: list[str] = field(default_factory=list)
     bind_quic:  list[str] = field(default_factory=list)
 
