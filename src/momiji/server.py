@@ -110,20 +110,20 @@ class Server:
         if self.config.certfile and self.config.bind_https:
             ssl_ctx = create_ssl_context(self.config)
 
+        http11_handler = lambda r, w: handle_http11(r, w, self.app)
+        https_handler = lambda r, w: handle_https(r, w, self.app)
+
         for kind, sock in bound:
             if kind == 'unix':
-                server = await asyncio.start_unix_server(
-                    lambda r, w: handle_http11(r, w, self.app), sock=sock, backlog=1024)
+                server = await asyncio.start_unix_server(http11_handler, sock=sock, backlog=1024)
                 servers.append(server)
 
             elif kind == 'http':
-                server = await asyncio.start_server(
-                    lambda r, w: handle_http11(r, w, self.app), sock=sock, backlog=1024)
+                server = await asyncio.start_server(http11_handler, sock=sock, backlog=1024)
                 servers.append(server)
 
             elif kind == 'https':
-                server = await asyncio.start_server(
-                    lambda r, w: handle_https(r, w, self.app), sock=sock, ssl=ssl_ctx, backlog=1024)
+                server = await asyncio.start_server(https_handler, sock=sock, ssl=ssl_ctx, backlog=1024)
                 servers.append(server)
 
         if self.config.certfile and self.config.bind_quic:
@@ -140,26 +140,30 @@ class Server:
         servers: list[asyncio.Server] = []
         quic_servers: list[QUICServer] = []
 
+        http11_handler = lambda r, w: handle_http11(r, w, self.app)
+        https_handler = lambda r, w: handle_https(r, w, self.app)
+
         for path in self.config.bind_unix:
-            server = await asyncio.start_unix_server(lambda r, w: handle_http11(r, w, self.app), path=str(path), backlog=1024)
+            server = await asyncio.start_unix_server(http11_handler, path=str(path), backlog=1024)
             servers.append(server)
 
         for addr in self.config.bind_http:
             host, port = parse_host_port(addr)
-            server = await asyncio.start_server(lambda r, w: handle_http11(r, w, self.app), host, port, backlog=1024)
+            server = await asyncio.start_server(http11_handler, host, port, backlog=1024)
             servers.append(server)
 
-        if self.config.certfile and self.config.bind_https:
-            ssl_ctx = create_ssl_context(self.config)
-            for addr in self.config.bind_https:
-                host, port = parse_host_port(addr)
-                server = await asyncio.start_server(lambda r, w: handle_https(r, w, self.app), host, port, ssl=ssl_ctx, backlog=1024)
-                servers.append(server)
+        if self.config.certfile:
+            if self.config.bind_https:
+                ssl_ctx = create_ssl_context(self.config)
+                for addr in self.config.bind_https:
+                    host, port = parse_host_port(addr)
+                    server = await asyncio.start_server(https_handler, host, port, ssl=ssl_ctx, backlog=1024)
+                    servers.append(server)
 
-        if self.config.certfile and self.config.bind_quic:
-            for addr in self.config.bind_quic:
-                host, port = parse_host_port(addr)
-                quic_servers.append(QUICServer(self.app, self.config, host, port))
+            if self.config.bind_quic:
+                for addr in self.config.bind_quic:
+                    host, port = parse_host_port(addr)
+                    quic_servers.append(QUICServer(self.app, self.config, host, port))
 
         if not servers and not quic_servers:
             return

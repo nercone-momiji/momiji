@@ -174,7 +174,7 @@ async def respond_h2(conn: H2Connection, writer: asyncio.StreamWriter, lock: asy
         to_send = conn.data_to_send()
         if to_send:
             writer.write(to_send)
-            await writer.drain()
+    await writer.drain()
 
 async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, app: App) -> None:
     client_ip, client_port = parse_peername(writer.get_extra_info('peername'))
@@ -201,7 +201,7 @@ async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             if not data:
                 break
 
-            pending: list[int] = []
+            pending: set[int] = set()
 
             async with lock:
                 events = connection.receive_data(data)
@@ -224,7 +224,7 @@ async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                             'body': bytearray()
                         }
                         if event.stream_ended is not None:
-                            pending.append(event.stream_id)
+                            pending.add(event.stream_id)
 
                     elif isinstance(event, DataReceived):
                         connection.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
@@ -233,11 +233,11 @@ async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                             streams[event.stream_id]['body'] += event.data
 
                         if event.stream_ended is not None and event.stream_id in streams:
-                            pending.append(event.stream_id)
+                            pending.add(event.stream_id)
 
                     elif isinstance(event, StreamEnded):
                         if event.stream_id in streams:
-                            pending.append(event.stream_id)
+                            pending.add(event.stream_id)
 
                     elif isinstance(event, ConnectionTerminated):
                         return
@@ -245,7 +245,8 @@ async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                 to_send = connection.data_to_send()
                 if to_send:
                     writer.write(to_send)
-                    await writer.drain()
+            if to_send:
+                await writer.drain()
 
             for sid in pending:
                 if sid in streams:
