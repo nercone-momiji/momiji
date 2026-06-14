@@ -52,7 +52,10 @@ async def get_response_body(response: Response) -> bytes:
     if isinstance(response.body, bytes):
         return response.body
     path = response.body
-    return await asyncio.to_thread(lambda: open(path, 'rb').read())
+    def read():
+        with open(path, 'rb') as f:
+            return f.read()
+    return await asyncio.to_thread(read)
 
 async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, app: App) -> None:
     connection = h11.Connection(our_role=h11.SERVER)
@@ -112,7 +115,9 @@ async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         response = Response("Internal Server Error".encode(), status_code=500)
                         body = b"Internal Server Error"
 
-                    out = connection.send(h11.Response(status_code=response.status_code, headers=list(response.headers.items())))
+                    resp_headers = dict(response.headers)
+                    resp_headers.setdefault('content-length', str(len(body)))
+                    out = connection.send(h11.Response(status_code=response.status_code, headers=list(resp_headers.items())))
                     if body:
                         out += connection.send(h11.Data(data=body))
                     out += connection.send(h11.EndOfMessage())
