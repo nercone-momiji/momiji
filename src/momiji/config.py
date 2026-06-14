@@ -6,7 +6,10 @@ from .protocol.tls import Group, Cipher
 class Config:
     workers: int = 0
 
-    # Protocols
+    request_read_timeout: float = 30.0
+    request_max_body_size: int = 10 * 1024 * 1024
+
+    # ALPN
     alpn_protocols: list[str] = field(default_factory=lambda: ["h3", "h2", "http/1.1"])
 
     # Ports

@@ -121,7 +121,7 @@ class QUICServer:
         self.port = port
 
     async def run(self):
-        quic_config = QuicConfiguration(is_client=False, alpn_protocols=H3_ALPN)
+        quic_config = QuicConfiguration(is_client=False, alpn=H3_ALPN)
         quic_config.load_cert_chain(self.config.certfile, self.config.keyfile)
 
         def make_protocol(*args, **kwargs):

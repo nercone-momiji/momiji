@@ -22,6 +22,7 @@ import rjsmin
 import rcssmin
 from scour import scour
 
+from ..config import Config
 from .tls import TLSInfo, extract_tls_info
 
 if TYPE_CHECKING:
@@ -221,7 +222,17 @@ def parse_pseudo_headers(raw_headers: Iterable[tuple]) -> tuple[str, str, Header
             headers.append(k, v)
     return method, path, headers
 
-async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, app: App):
+async def send_simple_response_h11(connection: h11.Connection, writer: asyncio.StreamWriter, status_code: int, body: bytes) -> None:
+    try:
+        out = connection.send(h11.Response(status_code=status_code, headers=[("content-length", str(len(body))), ("content-type", "text/plain"), ("connection", "close")]))
+        out += connection.send(h11.Data(data=body))
+        out += connection.send(h11.EndOfMessage())
+        writer.write(out)
+        await writer.drain()
+    except Exception:
+        pass
+
+async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, app: App, config: Config):
     connection = h11.Connection(our_role=h11.SERVER)
     client = parse_peername(writer.get_extra_info('peername'))
     ssl_object = writer.get_extra_info('ssl_object')
@@ -235,13 +246,18 @@ async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             target: str | None = None
             request_headers: Headers = Headers({})
             body_chunks: list[bytes] = []
+            body_size = 0
 
             while True:
                 event = connection.next_event()
 
                 if event is h11.NEED_DATA:
                     try:
-                        data = await reader.read(65536)
+                        data = await asyncio.wait_for(reader.read(65536), timeout=config.request_read_timeout)
+                    except asyncio.TimeoutError:
+                        if method is not None:
+                            await send_simple_response_h11(connection, writer, 408, b"Request Timeout")
+                        return
                     except Exception:
                         return
                     if not data:
@@ -253,7 +269,20 @@ async def handle_http11(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     target = event.target.decode()
                     request_headers = Headers({k.decode(): v.decode() for k, v in event.headers})
 
+                    content_length = request_headers.get("content-length")
+                    if content_length is not None:
+                        try:
+                            if int(content_length) > config.request_max_body_size:
+                                await send_simple_response_h11(connection, writer, 413, b"Payload Too Large")
+                                return
+                        except ValueError:
+                            pass
+
                 elif isinstance(event, h11.Data):
+                    body_size += len(event.data)
+                    if body_size > config.request_max_body_size:
+                        await send_simple_response_h11(connection, writer, 413, b"Payload Too Large")
+                        return
                     body_chunks.append(event.data)
 
                 elif isinstance(event, h11.EndOfMessage):
@@ -313,7 +342,7 @@ async def respond_http2(conn: H2Connection, writer: asyncio.StreamWriter, lock: 
             writer.write(to_send)
     await writer.drain()
 
-async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, app: App):
+async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, app: App, config: Config):
     client = parse_peername(writer.get_extra_info('peername'))
     tls = extract_tls_info(writer.get_extra_info('ssl_object'))
 
@@ -351,7 +380,9 @@ async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
     try:
         while True:
             try:
-                data = await reader.read(65536)
+                data = await asyncio.wait_for(reader.read(65536), timeout=config.request_read_timeout)
+            except asyncio.TimeoutError:
+                return
             except Exception:
                 return
             if not data:
@@ -368,8 +399,19 @@ async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                             'method': method,
                             'path': path,
                             'headers': headers,
-                            'body': bytearray()
+                            'body': bytearray(),
+                            'body_size': 0
                         }
+
+                        if content_length := headers.get("content-length"):
+                            try:
+                                if int(content_length) > config.request_max_body_size:
+                                    connection.reset_stream(event.stream_id, error_code=0x3) # FLOW_CONTROL_ERROR
+                                    streams.pop(event.stream_id, None)
+                                    continue
+                            except ValueError:
+                                pass
+
                         if event.stream_ended is not None:
                             pending.add(event.stream_id)
 
@@ -377,7 +419,13 @@ async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                         connection.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
 
                         if event.stream_id in streams:
-                            streams[event.stream_id]['body'] += event.data
+                            stream = streams[event.stream_id]
+                            stream['body_size'] += len(event.data)
+                            if stream['body_size'] > config.request_max_body_size:
+                                connection.reset_stream(event.stream_id, error_code=0x3)
+                                streams.pop(event.stream_id, None)
+                                continue
+                            stream['body'] += event.data
 
                         if event.stream_ended is not None and event.stream_id in streams:
                             pending.add(event.stream_id)

@@ -303,9 +303,9 @@ def create_ssl_context(config: 'Config') -> ssl.SSLContext:
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_cert_chain(config.certfile, config.keyfile)
     ctx.set_ciphers(':'.join(c.value for c in config.ciphers))
-    https_alpn = [p for p in config.alpn_protocols if p != 'h3']
+    https_alpn = [p for p in config.alpn if p != 'h3']
     if https_alpn:
-        ctx.set_alpn_protocols(https_alpn)
+        ctx.set_alpn(https_alpn)
     groups_str = ':'.join(g.value for g in config.groups)
     set_ssl_groups(ctx, groups_str)
     return ctx
