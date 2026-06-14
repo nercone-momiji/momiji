@@ -208,11 +208,20 @@ async def handle_http2(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
                 events = connection.receive_data(data)
                 for event in events:
                     if isinstance(event, RequestReceived):
-                        hdr_dict = dict(event.headers)
+                        method = 'GET'
+                        path = '/'
+                        headers: dict[str, str] = {}
+                        for k, v in event.headers:
+                            if k == ':method':
+                                method = v
+                            elif k == ':path':
+                                path = v
+                            elif not k.startswith(':'):
+                                headers[k] = v
                         streams[event.stream_id] = {
-                            'method': hdr_dict.get(':method', 'GET'),
-                            'path': hdr_dict.get(':path', '/'),
-                            'headers': {k: v for k, v in event.headers if not k.startswith(':')},
+                            'method': method,
+                            'path': path,
+                            'headers': headers,
                             'body': b''
                         }
                         if event.stream_ended is not None:

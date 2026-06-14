@@ -40,11 +40,22 @@ class HTTP3Protocol(QuicConnectionProtocol):
         elif self.http is not None and isinstance(event, (StreamDataReceived, StreamReset)):
             for h3_event in self.http.handle_event(event):
                 if isinstance(h3_event, HeadersReceived):
-                    headers = {decode(k): decode(v) for k, v in h3_event.headers}
+                    method = 'GET'
+                    path = '/'
+                    headers: dict[str, str] = {}
+                    for raw_k, raw_v in h3_event.headers:
+                        k = decode(raw_k)
+                        v = decode(raw_v)
+                        if k == ':method':
+                            method = v
+                        elif k == ':path':
+                            path = v
+                        elif not k.startswith(':'):
+                            headers[k] = v
                     self.streams[h3_event.stream_id] = {
-                        'method': headers.get(':method', 'GET'),
-                        'path': headers.get(':path', '/'),
-                        'headers': {k: v for k, v in headers.items() if not k.startswith(':')},
+                        'method': method,
+                        'path': path,
+                        'headers': headers,
                         'body': b''
                     }
                     if h3_event.stream_ended:
@@ -99,7 +110,7 @@ class HTTP3Protocol(QuicConnectionProtocol):
             response = Response("Internal Server Error".encode(), status_code=500)
             body = "Internal Server Error".encode()
 
-        resp_headers = [(b':status', str(response.status_code).encode()), (b'content-length', str(len(body)).encode())] + [(k.encode() if isinstance(k, str) else k, v.encode() if isinstance(v, str) else v) for k, v in response.headers.items()]
+        resp_headers = [(b':status', str(response.status_code).encode()), (b'content-length', str(len(body)).encode()), *((k.encode(), v.encode()) for k, v in response.headers.items())]
 
         self.http.send_headers(stream_id=stream_id, headers=resp_headers)
         self.http.send_data(stream_id=stream_id, data=body, end_stream=True)
