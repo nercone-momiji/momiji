@@ -42,11 +42,18 @@ class Decoder:
         return QPACK_STATIC_TABLE[index]
 
     def decode(self, block: bytes) -> list[tuple[bytes, bytes]]:
+        if not block:
+            raise QPACKError("empty header block")
         pos = 0
         required_insert_count, pos = decode_integer(block, pos, 8)
         if required_insert_count != 0:
             raise QPACKError("dynamic table not supported (capacity 0)")
+        if pos >= len(block):
+            raise QPACKError("truncated header block prefix")
+        sign = bool(block[pos] & 0x80)
         delta_base, pos = decode_integer(block, pos, 7)
+        if sign and delta_base != 0:
+            raise QPACKError("non-zero negative base disallowed without dynamic table")
 
         fields: list[tuple[bytes, bytes]] = []
         size = len(block)
@@ -66,12 +73,12 @@ class Decoder:
                 if not static:
                     raise QPACKError("dynamic reference unsupported")
                 name = self.static(index)[0]
-                value, pos = encode_string(block, pos, 7)
+                value, pos = decode_string(block, pos, 7)
                 fields.append((name, value))
 
             elif byte & 0x20:
-                name, pos = encode_string(block, pos, 3)
-                value, pos = encode_string(block, pos, 7)
+                name, pos = decode_string(block, pos, 3)
+                value, pos = decode_string(block, pos, 7)
                 fields.append((name, value))
 
             else:

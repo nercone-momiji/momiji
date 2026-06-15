@@ -91,17 +91,30 @@ def encode_integer(value: int, prefix_bits: int) -> bytearray:
     out.append(value)
     return out
 
+MAX_INTEGER_VALUE = (1 << 32) - 1
+MAX_INTEGER_BYTES = 8
+
 def decode_integer(data: bytes, pos: int, prefix_bits: int) -> tuple[int, int]:
     limit = (1 << prefix_bits) - 1
+    if pos >= len(data):
+        raise HPACKError("truncated integer")
     value = data[pos] & limit
     pos += 1
     if value < limit:
         return value, pos
     shift = 0
+    consumed = 0
     while True:
+        if pos >= len(data):
+            raise HPACKError("truncated integer continuation")
         byte = data[pos]
         pos += 1
+        consumed += 1
+        if consumed > MAX_INTEGER_BYTES:
+            raise HPACKError("integer encoding too long")
         value += (byte & 0x7F) << shift
+        if value > MAX_INTEGER_VALUE:
+            raise HPACKError("integer value too large")
         shift += 7
         if not byte & 0x80:
             break
@@ -179,21 +192,26 @@ class Decoder:
         headers: list[tuple[bytes, bytes]] = []
         pos = 0
         size = len(block)
+        seen_non_size_update = False
 
         while pos < size:
             byte = block[pos]
 
             if byte & 0x80:
                 index, pos = decode_integer(block, pos, 7)
-                headers.append(self._get(index))
+                headers.append(self.get(index))
+                seen_non_size_update = True
 
             elif byte & 0x40:
                 index, pos = decode_integer(block, pos, 6)
                 name, value, pos = self.read_literal(block, pos, index)
                 self.table.add(name, value)
                 headers.append((name, value))
+                seen_non_size_update = True
 
             elif byte & 0x20:
+                if seen_non_size_update:
+                    raise HPACKError("dynamic table size update not at start of block")
                 new_size, pos = decode_integer(block, pos, 5)
                 if new_size > self.max_allowed_size:
                     raise HPACKError("dynamic table size update exceeds limit")
@@ -203,6 +221,7 @@ class Decoder:
                 index, pos = decode_integer(block, pos, 4)
                 name, value, pos = self.read_literal(block, pos, index)
                 headers.append((name, value))
+                seen_non_size_update = True
 
         return headers
 
@@ -217,6 +236,13 @@ class Decoder:
 class Encoder:
     def __init__(self, max_size: int = 4096):
         self.table = DynamicTable(max_size)
+        self.pending_size_updates: list[int] = []
+
+    def resize(self, max_size: int):
+        if max_size == self.table.max_size:
+            return
+        self.table.resize(max_size)
+        self.pending_size_updates.append(max_size)
 
     def find(self, name: bytes, value: bytes) -> tuple[int | None, int | None]:
         full = STATIC_INDEX.get((name, value))
@@ -238,6 +264,12 @@ class Encoder:
 
     def encode(self, headers: list[tuple[bytes, bytes]]) -> bytes:
         out = bytearray()
+
+        for new_size in self.pending_size_updates:
+            field = encode_integer(new_size, 5)
+            field[0] |= 0x20
+            out += field
+        self.pending_size_updates.clear()
 
         for name, value in headers:
             name = name.lower()

@@ -7,7 +7,10 @@ class Config:
     workers: int = 0
 
     request_read_timeout: float = 30.0
+    request_body_timeout: float = 60.0
     request_max_body_size: int = 10 * 1024 * 1024
+    request_max_header_size: int = 64 * 1024
+    request_max_header_count: int = 100
 
     # ALPN
     alpn_protocols: list[str] = field(default_factory=lambda: ["h3", "h2", "http/1.1"])

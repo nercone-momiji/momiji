@@ -25,11 +25,12 @@ def encode(data: bytes) -> bytes:
 
     for byte in data:
         code, length = HUFFMAN_TABLE[byte]
-        buffer = (buffer << length) | code
+        buffer = ((buffer << length) | code) & ((1 << (bits + length)) - 1)
         bits += length
         while bits >= 8:
             bits -= 8
             out.append((buffer >> bits) & 0xFF)
+            buffer &= (1 << bits) - 1 if bits else 0
 
     if bits:
         out.append(((buffer << (8 - bits)) | ((1 << (8 - bits)) - 1)) & 0xFF)

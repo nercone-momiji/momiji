@@ -1,6 +1,6 @@
 import time
 from typing import Literal, SupportsIndex
-from datetime import datetime
+from datetime import datetime, timezone
 
 class CookieItem:
     def __init__(self, name: str, value: str, secure: bool = False, httponly: bool = False, partitioned: bool = False, path: str | None = None, domain: str | None = None, expires: datetime | None = None, max_age: int | None = None, samesite: Literal["Strict", "Lax", "None"] | None = None):
@@ -30,7 +30,12 @@ class CookieItem:
         if self.domain is not None:
             parts.append(f"Domain={self.domain}")
         if self.expires is not None:
-            parts.append(f"Expires={self.expires.strftime('%a, %d %b %Y %H:%M:%S GMT')}")
+            expires = self.expires
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=timezone.utc)
+            else:
+                expires = expires.astimezone(timezone.utc)
+            parts.append(f"Expires={expires.strftime('%a, %d %b %Y %H:%M:%S GMT')}")
         if self.max_age is not None:
             parts.append(f"Max-Age={self.max_age}")
         if self.secure:
@@ -238,5 +243,9 @@ class ServerTiming:
         sorted_timings = sorted(((key, value) for key, value in self.timings.items() if value[1] is not None), key=lambda item: item[1][0])
         for key, value in sorted_timings:
             duration = round((value[1] - value[0]) * 1000, 3)
-            headers.append(f"{key}{f';desc=\"{value[2]}\"' if value[2] is not None else ''};dur={duration}")
+            desc = ""
+            if value[2] is not None:
+                escaped = str(value[2]).replace("\\", "\\\\").replace('"', '\\"').replace("\r", " ").replace("\n", " ")
+                desc = f';desc="{escaped}"'
+            headers.append(f"{key}{desc};dur={duration}")
         return ", ".join(headers)

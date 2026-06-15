@@ -69,10 +69,15 @@ class Headers:
         return item.lower() in self.headers
 
     def get(self, key: str, default=None) -> str | None:
-        if key.lower() in self.headers:
-            return ", ".join(self.headers.get(key.lower()))
-        else:
+        values = self.headers.get(key.lower())
+        if not values:
             return default
+        if key.lower() == "set-cookie":
+            return values[0]
+        return ", ".join(values)
+
+    def get_all(self, key: str) -> list[str]:
+        return list(self.headers.get(key.lower(), ()))
 
     def set(self, key: str, value: str, override: bool = True):
         if override or key.lower() not in self.headers:
