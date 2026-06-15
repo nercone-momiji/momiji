@@ -9,6 +9,11 @@ from dataclasses import dataclass, field
 from ..tls import Group, Cipher
 
 @dataclass
+class Listener:
+    sock: socket.socket
+    kind: Literal["http", "https", "quic", "unix"]
+
+@dataclass
 class TLSInfo:
     version: Literal["SSLv3.0", "TLSv1.0", "TLSv1.1", "TLSv1.2", "TLSv1.3"] | None
     group: Group | None
@@ -47,11 +52,6 @@ class Response:
     @property
     def has_real_body(self) -> bool:
         return self.body is not None and isinstance(self.body, bytes)
-
-@dataclass
-class Listener:
-    sock: socket.socket
-    kind: Literal["http", "https", "quic", "unix"]
 
 class Headers:
     def __init__(self, headers: dict[str, str]):

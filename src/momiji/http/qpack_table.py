@@ -97,5 +97,5 @@ QPACK_STATIC_TABLE: list[tuple[bytes, bytes]] = [
     (b'user-agent', b''),
     (b'x-forwarded-for', b''),
     (b'x-frame-options', b'deny'),
-    (b'x-frame-options', b'sameorigin'),
+    (b'x-frame-options', b'sameorigin')
 ]

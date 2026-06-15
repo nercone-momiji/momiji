@@ -52,9 +52,11 @@ def parse_fields(body, fields, *, protocol, client, scheme, secure, tls, quic) -
     method = target = authority = pseudo_scheme = None
     headers = Headers({})
     seen_regular = False
+
     for name, value in fields:
         name_s = name.decode("latin-1")
         value_s = value.decode("latin-1")
+
         if name_s.startswith(":"):
             if seen_regular:
                 raise ParseError("pseudo-header after regular header")
@@ -68,14 +70,17 @@ def parse_fields(body, fields, *, protocol, client, scheme, secure, tls, quic) -
                 authority = value_s
             else:
                 raise ParseError(f"unknown pseudo-header {name_s}")
+
         else:
             seen_regular = True
             headers.append(name_s, value_s)
 
     if method is None or target is None:
         raise ParseError("missing :method or :path")
+
     if method not in METHODS:
         raise ParseError("unsupported method", 501)
+
     if authority is not None and "host" not in headers:
         headers.set("host", authority)
 

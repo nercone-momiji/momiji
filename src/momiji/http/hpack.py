@@ -65,7 +65,7 @@ STATIC_TABLE: list[tuple[bytes, bytes]] = [
     (b"user-agent", b""),
     (b"vary", b""),
     (b"via", b""),
-    (b"www-authenticate", b""),
+    (b"www-authenticate", b"")
 ]
 
 STATIC_INDEX: dict[tuple[bytes, bytes], int] = {}
@@ -222,8 +222,10 @@ class Encoder:
         full = STATIC_INDEX.get((name, value))
         if full is not None:
             return full, full
+
         name_index = STATIC_NAME_INDEX.get(name)
         dyn_offset = len(STATIC_TABLE)
+
         for i, (n, v) in enumerate(self.table.entries):
             if n == name:
                 idx = dyn_offset + i + 1
@@ -231,26 +233,32 @@ class Encoder:
                     return idx, idx
                 if name_index is None:
                     name_index = idx
+
         return None, name_index
 
     def encode(self, headers: list[tuple[bytes, bytes]]) -> bytes:
         out = bytearray()
+
         for name, value in headers:
             name = name.lower()
             full_index, name_index = self.find(name, value)
+
             if full_index is not None:
                 field = encode_integer(full_index, 7)
                 field[0] |= 0x80
                 out += field
+
             elif name_index is not None:
                 field = encode_integer(name_index, 6)
                 field[0] |= 0x40
                 out += field
                 out += encode_string(value)
                 self.table.add(name, value)
+
             else:
                 out.append(0x40)
                 out += encode_string(name)
                 out += encode_string(value)
                 self.table.add(name, value)
+
         return bytes(out)

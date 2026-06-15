@@ -65,10 +65,13 @@ async def handle(app: App, config: Config, listeners: list[Listener], ssl_contex
             transports.append(transport)
 
     stop = loop.create_future()
+
     try:
         await stop
+
     except asyncio.CancelledError:
         pass
+
     finally:
         for server in servers:
             server.close()

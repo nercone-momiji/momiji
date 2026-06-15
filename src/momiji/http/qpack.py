@@ -52,12 +52,14 @@ class Decoder:
         size = len(block)
         while pos < size:
             byte = block[pos]
+
             if byte & 0x80:
                 static = byte & 0x40
                 index, pos = decode_integer(block, pos, 6)
                 if not static:
                     raise QPACKError("dynamic reference unsupported")
                 fields.append(self.static(index))
+
             elif byte & 0x40:
                 static = byte & 0x10
                 index, pos = decode_integer(block, pos, 4)
@@ -66,32 +68,40 @@ class Decoder:
                 name = self.static(index)[0]
                 value, pos = encode_string(block, pos, 7)
                 fields.append((name, value))
+
             elif byte & 0x20:
                 name, pos = encode_string(block, pos, 3)
                 value, pos = encode_string(block, pos, 7)
                 fields.append((name, value))
+
             else:
                 raise QPACKError("post-base / dynamic reference unsupported")
+
         return fields
 
 class Encoder:
     def encode(self, fields: list[tuple[bytes, bytes]]) -> bytes:
         out = bytearray(b"\x00\x00")
+
         for name, value in fields:
             name = name.lower()
             full = STATIC_INDEX.get((name, value))
+
             if full is not None:
                 field = encode_integer(full, 6)
                 field[0] |= 0xC0
                 out += field
                 continue
+
             name_index = STATIC_NAME_INDEX.get(name)
             if name_index is not None:
                 field = encode_integer(name_index, 4)
                 field[0] |= 0x50
                 out += field
                 out += encode_string(value, 7)
+
             else:
                 out += encode_string(name, 3, flags=0x20)
                 out += encode_string(value, 7)
+
         return bytes(out)

@@ -147,26 +147,35 @@ class H2Connection:
             preface = await self.reader.readexactly(len(PREFACE))
             if preface != PREFACE:
                 return
+
         self.writer.write(serialize_settings(self.local_settings))
         await self.writer.drain()
+
         try:
             while True:
                 header = await self.reader.readexactly(9)
                 length = int.from_bytes(header[:3], "big")
                 frame_type, flags = header[3], header[4]
                 stream_id = int.from_bytes(header[5:9], "big") & 0x7FFFFFFF
+
                 if length > self.local_settings[Setting.MAX_FRAME_SIZE]:
                     raise H2ConnectionError(ErrorCode.FRAME_SIZE_ERROR)
+
                 payload = await self.reader.readexactly(length)
                 await self.dispatch(frame_type, flags, stream_id, payload)
+
         except (asyncio.IncompleteReadError, ConnectionError):
             pass
+
         except H2ConnectionError as exc:
             await self.goaway(exc.code)
+
         finally:
             for task in list(self.tasks):
                 task.cancel()
+
             self.writer.close()
+
             try:
                 await self.writer.wait_closed()
             except (ConnectionError, OSError):
@@ -211,22 +220,29 @@ class H2Connection:
         if flags & Flag.PADDED:
             pad_length = payload[0]
             payload = payload[1:]
+
             if pad_length > len(payload):
                 raise H2ConnectionError(ErrorCode.PROTOCOL_ERROR, "bad padding")
+
             payload = payload[:len(payload) - pad_length]
+
         return payload
 
     def on_headers(self, flags, stream_id, payload):
         if stream_id == 0 or stream_id % 2 == 0:
             raise H2ConnectionError(ErrorCode.PROTOCOL_ERROR, "invalid stream id")
+
         block = self.strip_padding(flags, payload)
         if flags & Flag.PRIORITY:
             block = block[5:]
+
         stream = Stream(stream_id, self.peer_settings[Setting.INITIAL_WINDOW_SIZE])
         stream.pending_end_stream = bool(flags & Flag.END_STREAM)
         stream.fragments += block
+
         self.streams[stream_id] = stream
         self.last_stream_id = max(self.last_stream_id, stream_id)
+
         if flags & Flag.END_HEADERS:
             self.finalize_headers(stream)
         else:
@@ -235,8 +251,10 @@ class H2Connection:
     def on_continuation(self, flags, stream_id, payload):
         if self.expecting_continuation != stream_id:
             raise H2ConnectionError(ErrorCode.PROTOCOL_ERROR, "unexpected CONTINUATION")
+
         stream = self.streams[stream_id]
         stream.fragments += payload
+
         if flags & Flag.END_HEADERS:
             self.expecting_continuation = None
             self.finalize_headers(stream)
@@ -246,7 +264,9 @@ class H2Connection:
             stream.fields = self.decoder.decode(bytes(stream.fragments))
         except hpack.HPACKError:
             raise H2ConnectionError(ErrorCode.COMPRESSION_ERROR)
+
         stream.fragments = bytearray()
+
         if stream.pending_end_stream:
             self.spawn_response(stream)
 
@@ -254,46 +274,63 @@ class H2Connection:
         stream = self.streams.get(stream_id)
         self.conn_recv_window -= len(payload)
         data = self.strip_padding(flags, payload)
+
         if stream is None or stream.closed:
             await self.replenish(0, len(payload))
             return
+
         stream.body += data
+
         if len(stream.body) > self.config.request_max_body_size:
             self.reset_stream(stream_id, ErrorCode.ENHANCE_YOUR_CALM)
             return
+
         await self.replenish(stream_id, len(payload))
+
         if flags & Flag.END_STREAM:
             self.spawn_response(stream)
 
     async def replenish(self, stream_id, amount):
         if amount <= 0:
             return
+
         self.conn_recv_window += amount
+
         async with self.write_lock:
             self.writer.write(serialize_frame(Frame.WINDOW_UPDATE, 0, 0, amount.to_bytes(4, "big")))
+
             if stream_id and stream_id in self.streams and not self.streams[stream_id].closed:
                 self.writer.write(serialize_frame(Frame.WINDOW_UPDATE, 0, stream_id, amount.to_bytes(4, "big")))
+
             await self.writer.drain()
 
     async def on_settings(self, flags, payload):
         if flags & Flag.ACK:
             return
+
         if len(payload) % 6 != 0:
             raise H2ConnectionError(ErrorCode.FRAME_SIZE_ERROR)
+
         old_initial = self.peer_settings[Setting.INITIAL_WINDOW_SIZE]
+
         for i in range(0, len(payload), 6):
             sid = int.from_bytes(payload[i:i + 2], "big")
             value = int.from_bytes(payload[i + 2:i + 6], "big")
             self.peer_settings[sid] = value
+
         if Setting.HEADER_TABLE_SIZE in self.peer_settings:
             self.encoder.table.resize(self.peer_settings[Setting.HEADER_TABLE_SIZE])
+
         new_initial = self.peer_settings[Setting.INITIAL_WINDOW_SIZE]
+
         if new_initial != old_initial:
             delta = new_initial - old_initial
+
             async with self.flow:
                 for stream in self.streams.values():
                     stream.send_window += delta
                 self.flow.notify_all()
+
         async with self.write_lock:
             self.writer.write(serialize_settings({}, ack=True))
             await self.writer.drain()
@@ -301,24 +338,31 @@ class H2Connection:
     async def on_window_update(self, stream_id, payload):
         if len(payload) != 4:
             raise H2ConnectionError(ErrorCode.FRAME_SIZE_ERROR)
+
         increment = int.from_bytes(payload, "big") & 0x7FFFFFFF
         if increment == 0:
             if stream_id:
                 self.reset_stream(stream_id, ErrorCode.PROTOCOL_ERROR)
                 return
+
             raise H2ConnectionError(ErrorCode.PROTOCOL_ERROR)
+
         async with self.flow:
             if stream_id == 0:
                 self.conn_send_window += increment
+
             elif stream_id in self.streams:
                 self.streams[stream_id].send_window += increment
+
             self.flow.notify_all()
 
     async def on_ping(self, flags, payload):
         if flags & Flag.ACK:
             return
+
         if len(payload) != 8:
             raise H2ConnectionError(ErrorCode.FRAME_SIZE_ERROR)
+
         async with self.write_lock:
             self.writer.write(serialize_frame(Frame.PING, Flag.ACK, 0, payload))
             await self.writer.drain()
@@ -332,13 +376,16 @@ class H2Connection:
         stream = self.streams.get(stream_id)
         if stream:
             stream.closed = True
+
         self.writer.write(serialize_frame(Frame.RST_STREAM, 0, stream_id, int(code).to_bytes(4, "big")))
 
     async def goaway(self, code: ErrorCode):
         if self.goaway_sent:
             return
+
         self.goaway_sent = True
         payload = self.last_stream_id.to_bytes(4, "big") + int(code).to_bytes(4, "big")
+
         try:
             self.writer.write(serialize_frame(Frame.GOAWAY, 0, 0, payload))
             await self.writer.drain()
@@ -366,16 +413,20 @@ class H2Connection:
             frames, body = await build(response, encoder=self.encoder, stream_id=stream.id)
             self.writer.write(frames)
             await self.writer.drain()
+
         await self.send_body(stream, body)
         stream.closed = True
 
     async def send_body(self, stream, body):
         if body is None:
             return
+
         if not isinstance(body, (bytes, bytearray)):
             with open(body, "rb") as f:
                 body = f.read()
+
         data = bytes(body)
+
         if not data:
             async with self.write_lock:
                 self.writer.write(serialize_frame(Frame.DATA, Flag.END_STREAM, stream.id, b""))
@@ -384,18 +435,23 @@ class H2Connection:
 
         offset = 0
         total = len(data)
+
         while offset < total:
             async with self.flow:
                 while (self.conn_send_window <= 0 or stream.send_window <= 0) and not stream.closed:
                     await self.flow.wait()
+
                 if stream.closed:
                     return
+
                 allowed = min(self.conn_send_window, stream.send_window, self.peer_settings[Setting.MAX_FRAME_SIZE], total - offset)
                 chunk = data[offset:offset + allowed]
                 self.conn_send_window -= len(chunk)
                 stream.send_window -= len(chunk)
+
             offset += len(chunk)
             flags = Flag.END_STREAM if offset >= total else 0
+
             async with self.write_lock:
                 self.writer.write(serialize_frame(Frame.DATA, flags, stream.id, chunk))
                 await self.writer.drain()

@@ -117,7 +117,9 @@ class H3Protocol(QuicConnectionProtocol):
         if stream is None:
             stream = RequestStream()
             self.requests[stream_id] = stream
+
         stream.buffer += data
+
         try:
             self.parse_frames(stream)
         except (qpack.QPACKError, ValueError):
@@ -125,6 +127,7 @@ class H3Protocol(QuicConnectionProtocol):
             self.requests.pop(stream_id, None)
             self.transmit()
             return
+
         if end_stream and not stream.dispatched:
             stream.dispatched = True
             self.spawn(stream_id, stream)
@@ -134,15 +137,21 @@ class H3Protocol(QuicConnectionProtocol):
             type_result = decode_varint(stream.buffer, 0)
             if type_result is None:
                 return
+
             frame_type, pos = type_result
+
             length_result = decode_varint(stream.buffer, pos)
             if length_result is None:
                 return
+
             length, pos = length_result
             if len(stream.buffer) - pos < length:
                 return
+
             payload = bytes(stream.buffer[pos:pos + length])
+
             del stream.buffer[:pos + length]
+
             if frame_type == FRAME_HEADERS:
                 stream.fields = self.decoder.decode(payload)
             elif frame_type == FRAME_DATA:
@@ -160,11 +169,7 @@ class H3Protocol(QuicConnectionProtocol):
             return
 
         try:
-            request = await parse(
-                bytes(stream.body), protocol="HTTP/3.0", fields=stream.fields,
-                client=("0.0.0.0", 0), scheme="https", secure=True, tls=self.tls,
-                quic=QUICInfo(self._quic.host_cid, stream_id)
-            )
+            request = await parse(bytes(stream.body), protocol="HTTP/3.0", fields=stream.fields, client=("0.0.0.0", 0), scheme="https", secure=True, tls=self.tls, quic=QUICInfo(self._quic.host_cid, stream_id))
         except ParseError:
             self._quic.reset_stream(stream_id, 0x0105)
             self.transmit()

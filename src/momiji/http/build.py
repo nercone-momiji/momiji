@@ -3,12 +3,10 @@ from __future__ import annotations
 import os
 from .models import Response
 
-CONNECTION_HEADERS = {"connection", "keep-alive", "transfer-encoding", "upgrade", "proxy-connection"}
-
 def response_fields(response: Response) -> list[tuple[bytes, bytes]]:
     fields: list[tuple[bytes, bytes]] = [(b":status", str(response.status_code).encode())]
     for key, value in response.headers.items():
-        if key.lower() in CONNECTION_HEADERS:
+        if key.lower() in ("connection", "keep-alive", "transfer-encoding", "upgrade", "proxy-connection"):
             continue
         fields.append((key.lower().encode("latin-1"), value.encode("latin-1")))
     return fields
