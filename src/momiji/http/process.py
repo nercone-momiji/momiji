@@ -210,6 +210,13 @@ async def process(app: App | None, request: Request, response: Response | None =
         response.headers.set("Content-Type", response.content_type or response.headers.get("Content-Type") or "application/octet-stream")
         response.headers.set("Content-Length", str(len(response.body)))
 
+    elif response.is_streaming:
+        response.headers.set("Content-Type", response.content_type or response.headers.get("Content-Type") or "application/octet-stream")
+        response.headers.remove("Content-Length")
+
+        if request.protocol == "HTTP/1.1":
+            response.headers.set("Transfer-Encoding", "chunked")
+
     elif response.body is not None:
         try:
             mime, _ = mimetypes.guess_type(os.fspath(response.body))

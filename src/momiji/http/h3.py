@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import asyncio
 import ipaddress
 from typing import Literal
 from dataclasses import dataclass, field
@@ -18,6 +19,11 @@ class H3Info:
     stream_id: int
 
 @dataclass
+class H3WSUpgrade:
+    stream_id: int
+    request: Request
+
+@dataclass
 class Stream:
     method: str = ""
     target: str = ""
@@ -32,21 +38,30 @@ class H3:
         self.quic = quic
         self.connection = H3Connection(quic)
         self.streams: dict[int, Stream] = {}
+        self.ws_streams: dict[int, asyncio.Queue[bytes | None]] = {}
 
-    def receive(self, *, client: tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int], scheme: Literal["http", "https"] = "https", secure: bool = True, tls: TLSInfo | None = None) -> list[Request]:
+    def receive(self, *, client: tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int], scheme: Literal["http", "https"] = "https", secure: bool = True, tls: TLSInfo | None = None) -> tuple[list[Request], list[H3WSUpgrade]]:
         completed: list[Request] = []
+        ws_upgrades: list[H3WSUpgrade] = []
+
         while True:
             quic_event = self.quic.next_event()
             if quic_event is None:
                 break
-            completed.extend(self.handle_event(quic_event, client=client, scheme=scheme, secure=secure, tls=tls))
-        return completed
+            r, ws = self.handle_event(quic_event, client=client, scheme=scheme, secure=secure, tls=tls)
+            completed.extend(r)
+            ws_upgrades.extend(ws)
 
-    def handle_event(self, quic_event, *, client: tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int], scheme: Literal["http", "https"] = "https", secure: bool = True, tls: TLSInfo | None = None) -> list[Request]:
+        return completed, ws_upgrades
+
+    def handle_event(self, quic_event, *, client: tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int], scheme: Literal["http", "https"] = "https", secure: bool = True, tls: TLSInfo | None = None) -> tuple[list[Request], list[H3WSUpgrade]]:
         completed: list[Request] = []
+        ws_upgrades: list[H3WSUpgrade] = []
+
         for event in self.connection.handle_event(quic_event):
             if isinstance(event, HeadersReceived):
                 stream = Stream(scheme=scheme)
+                ws_protocol: str | None = None
                 for name, value in event.headers:
                     nb = name.decode("ascii") if isinstance(name, (bytes, bytearray)) else name
                     vb = value.decode("utf-8") if isinstance(value, (bytes, bytearray)) else value
@@ -59,20 +74,41 @@ class H3:
                     elif nb == ":authority":
                         stream.authority = vb
                         stream.headers.append("host", vb)
+                    elif nb == ":protocol":
+                        ws_protocol = vb
                     elif not nb.startswith(":"):
                         stream.headers.append(nb, vb)
+
+                if stream.method == "CONNECT" and ws_protocol == "websocket":
+                    queue: asyncio.Queue[bytes | None] = asyncio.Queue()
+                    self.ws_streams[event.stream_id] = queue
+                    request = Request(client=client, scheme=stream.scheme if stream.scheme in ("http", "https") else "https", secure=secure, protocol="HTTP/3.0", method="GET", target=stream.target, headers=stream.headers, body=None, h2=None, h3=H3Info(connection_id=self.connection_id, stream_id=event.stream_id), tls=tls)
+                    ws_upgrades.append(H3WSUpgrade(stream_id=event.stream_id, request=request))
+                    continue
+
                 self.streams[event.stream_id] = stream
                 if event.stream_ended:
                     completed.append(self.finalize(event.stream_id, client, secure, tls))
 
             elif isinstance(event, DataReceived):
-                stream = self.streams.get(event.stream_id)
-                if stream is not None:
-                    stream.body.extend(event.data)
-                if event.stream_ended and event.stream_id in self.streams:
-                    completed.append(self.finalize(event.stream_id, client, secure, tls))
+                if event.stream_id in self.ws_streams:
+                    if event.data:
+                        self.ws_streams[event.stream_id].put_nowait(event.data)
 
-        return completed
+                    if event.stream_ended:
+                        self.ws_streams[event.stream_id].put_nowait(None)
+                        del self.ws_streams[event.stream_id]
+
+                else:
+                    stream = self.streams.get(event.stream_id)
+
+                    if stream is not None:
+                        stream.body.extend(event.data)
+
+                    if event.stream_ended and event.stream_id in self.streams:
+                        completed.append(self.finalize(event.stream_id, client, secure, tls))
+
+        return completed, ws_upgrades
 
     def finalize(self, stream_id: int, client: tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int], secure: bool, tls: TLSInfo | None) -> Request:
         stream = self.streams.pop(stream_id)
@@ -100,5 +136,27 @@ class H3:
             self.connection.send_headers(stream_id, headers, end_stream=True)
             return None
 
+    def send_headers_only(self, stream_id: int, response: Response) -> None:
+        headers: list[tuple[bytes, bytes]] = [(b":status", str(response.status_code).encode("ascii"))]
+        for name, value in response.headers.items():
+            lname = name.lower()
+            if lname in ("connection", "transfer-encoding", "keep-alive", "upgrade", "proxy-connection"):
+                continue
+            headers.append((lname.encode("ascii"), value.encode("utf-8")))
+        self.connection.send_headers(stream_id, headers, end_stream=False)
+
     def send_chunk(self, stream_id: int, chunk: bytes, end_stream: bool) -> None:
         self.connection.send_data(stream_id, chunk, end_stream=end_stream)
+
+    def ws_accept(self, stream_id: int) -> None:
+        self.connection.send_headers(stream_id, [(b":status", b"200")], end_stream=False)
+
+    def ws_send(self, stream_id: int, data: bytes) -> None:
+        self.connection.send_data(stream_id, data, end_stream=False)
+
+    def ws_close(self, stream_id: int) -> None:
+        self.ws_streams.pop(stream_id, None)
+        try:
+            self.connection.send_data(stream_id, b"", end_stream=True)
+        except Exception:
+            pass

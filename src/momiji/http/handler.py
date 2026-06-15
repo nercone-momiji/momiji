@@ -12,9 +12,9 @@ from aioquic.quic.configuration import QuicConfiguration
 from aioquic.quic.events import HandshakeCompleted
 
 from .h1 import H1
-from .h2 import H2
-from .h3 import H3
-from .models import Listener, Request
+from .h2 import H2, H2WSUpgrade
+from .h3 import H3, H3WSUpgrade
+from .models import Listener, Request, Response
 from .process import process
 from .websocket import WebSocket, compute_accept, parse_frames
 from ..tls import TLS, TLSInfo
@@ -32,6 +32,40 @@ def parse_peername(transport: asyncio.BaseTransport) -> tuple[ipaddress.IPv4Addr
         return (ipaddress.ip_address(host), int(port))
     except ValueError:
         return (ipaddress.IPv4Address("0.0.0.0"), int(port))
+
+class H2WebSocketTransport:
+    def __init__(self, h2: H2, stream_id: int, tcp_transport: asyncio.Transport):
+        self.h2 = h2
+        self.stream_id = stream_id
+        self.tcp = tcp_transport
+
+    def write(self, data: bytes) -> None:
+        if self.tcp.is_closing():
+            return
+        out = self.h2.ws_send(self.stream_id, data)
+        if out:
+            self.tcp.write(out)
+
+    def close(self) -> None:
+        out = self.h2.ws_close(self.stream_id)
+        if out and not self.tcp.is_closing():
+            self.tcp.write(out)
+
+class H3WebSocketTransport:
+    def __init__(self, h3: H3, stream_id: int, protocol: H3Protocol):
+        self.h3 = h3
+        self.stream_id = stream_id
+        self.protocol = protocol
+
+    def write(self, data: bytes) -> None:
+        if not data:
+            return
+        self.h3.ws_send(self.stream_id, data)
+        self.protocol.transmit()
+
+    def close(self) -> None:
+        self.h3.ws_send(self.stream_id)
+        self.protocol.transmit()
 
 class TCPProtocol(asyncio.Protocol):
     def __init__(self, handler: Handler):
@@ -56,13 +90,16 @@ class TCPProtocol(asyncio.Protocol):
             self.secure = True
             self.scheme = "https"
             self.tls = TLS.extract_tls_info(ssl_object)
+
             alpn = ssl_object.selected_alpn_protocol()
             if alpn == "h2" and "h2" in self.handler.config.protocols:
-                self.h2 = H2()
+                self.h2 = H2(connection_id=os.urandom(8))
                 self.transport.write(self.h2.initiate())
+
             elif "http/1.1" not in self.handler.config.protocols:
                 self.transport.close()
                 return
+
         else:
             self.secure = self.handler.listener.kind == "https"
             self.scheme = "https" if self.secure else "http"
@@ -82,16 +119,22 @@ class TCPProtocol(asyncio.Protocol):
             return
 
         if self.h2 is not None:
-            out, requests, closed = self.h2.receive(data, client=self.client, scheme=self.scheme, secure=self.secure, tls=self.tls)
+            out, requests, ws_upgrades, closed = self.h2.receive(data, client=self.client, scheme=self.scheme, secure=self.secure, tls=self.tls)
             if out:
                 self.transport.write(out)
+
             for request in requests:
                 asyncio.create_task(self.respond_h2(request))
+
+            for ws_upgrade in ws_upgrades:
+                asyncio.create_task(self.respond_ws_h2(ws_upgrade))
+
             if closed:
                 goaway = self.h2.close()
                 if goaway:
                     self.transport.write(goaway)
                 self.transport.close()
+
             return
 
         self.buffer.extend(data)
@@ -168,6 +211,10 @@ class TCPProtocol(asyncio.Protocol):
             _, _, h3_port = self.handler.config.bind_quic[0].rpartition(':')
             response.headers.set("Alt-Svc", f"h3=\":{int(h3_port)}\"", override=False)
 
+        if response.is_streaming:
+            await self.stream_h1(response)
+            return
+
         result = H1.build(response)
 
         if isinstance(result, tuple):
@@ -182,6 +229,23 @@ class TCPProtocol(asyncio.Protocol):
 
         if not self.keep_alive:
             self.transport.close()
+
+    async def stream_h1(self, response: Response) -> None:
+        if self.transport is None:
+            return
+
+        self.transport.write(H1.build_head(response))
+
+        try:
+            async for chunk in response.body:
+                if chunk and self.transport is not None:
+                    self.transport.write(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n")
+
+        finally:
+            if self.transport is not None:
+                self.transport.write(b"0\r\n\r\n")
+                if not self.keep_alive:
+                    self.transport.close()
 
     async def upgrade_websocket(self, request: Request, ws_key: str) -> None:
         if self.transport is None:
@@ -250,6 +314,10 @@ class TCPProtocol(asyncio.Protocol):
             _, _, h3_port = self.handler.config.bind_quic[0].rpartition(':')
             response.headers.set("Alt-Svc", f"h3=\":{int(h3_port)}\"", override=False)
 
+        if response.is_streaming:
+            await self.stream_h2(request.h2.stream_id, response)
+            return
+
         out, alt_body = self.h2.send(request.h2.stream_id, response)
 
         if out:
@@ -257,6 +325,61 @@ class TCPProtocol(asyncio.Protocol):
 
         if alt_body is not None:
             await self.send_file_h2(request.h2.stream_id, alt_body, response.file_range)
+
+    async def stream_h2(self, stream_id: int, response: Response) -> None:
+        if self.transport is None or self.h2 is None:
+            return
+
+        out = self.h2.send_headers(stream_id, response)
+        if out:
+            self.transport.write(out)
+
+        try:
+            async for chunk in response.body:
+                if chunk and self.transport is not None and self.h2 is not None:
+                    out = self.h2.send_chunk(stream_id, chunk, end_stream=False)
+                    if out:
+                        self.transport.write(out)
+
+        finally:
+            if self.h2 is not None and self.transport is not None:
+                out = self.h2.send_chunk(stream_id, b"", end_stream=True)
+                if out:
+                    self.transport.write(out)
+
+    async def respond_ws_h2(self, upgrade: H2WSUpgrade) -> None:
+        if self.transport is None or self.h2 is None:
+            return
+
+        out = self.h2.ws_accept(upgrade.stream_id)
+        if out:
+            self.transport.write(out)
+
+        ws_transport = H2WebSocketTransport(self.h2, upgrade.stream_id, self.transport)
+        ws = WebSocket(ws_transport, require_masking=False)
+
+        asyncio.create_task(self.read_ws_h2(upgrade.stream_id, ws))
+        await self.run_websocket(upgrade.request, ws)
+
+    async def read_ws_h2(self, stream_id: int, ws: WebSocket) -> None:
+        if self.h2 is None:
+            return
+
+        queue = self.h2.ws_streams.get(stream_id)
+        if queue is None:
+            return
+
+        buf = bytearray()
+
+        while True:
+            chunk = await queue.get()
+            if chunk is None:
+                ws.queue.put_nowait(None)
+                break
+
+            buf.extend(chunk)
+            for frame in parse_frames(buf):
+                ws.feed_frame(frame)
 
     async def send_file_h2(self, stream_id: int, path: os.PathLike, file_range: tuple[int, int] | None = None) -> None:
         if self.transport is None or self.h2 is None:
@@ -299,7 +422,15 @@ class TCPProtocol(asyncio.Protocol):
 
     def connection_lost(self, exc: BaseException | None) -> None:
         self.transport = None
-        self.h2 = None
+
+        if self.h2 is not None:
+            for queue in self.h2.ws_streams.values():
+                queue.put_nowait(None)
+            self.h2 = None
+
+        if self.ws is not None and not self.ws.closed:
+            self.ws.queue.put_nowait(None)
+
         self.buffer.clear()
 
 class H3Protocol(QuicConnectionProtocol):
@@ -318,14 +449,23 @@ class H3Protocol(QuicConnectionProtocol):
             self.h3 = H3(self._quic, connection_id=self._quic.host_cid)
             self._client = parse_peername(self._transport)
 
-        for request in self.h3.handle_event(event, client=self._client, scheme="https", secure=True, tls=self._tls):
+        requests, ws_upgrades = self.h3.handle_event(event, client=self._client, scheme="https", secure=True, tls=self._tls)
+
+        for request in requests:
             asyncio.create_task(self.respond(request))
+
+        for ws_upgrade in ws_upgrades:
+            asyncio.create_task(self.ws_response_h3(ws_upgrade))
 
     async def respond(self, request: Request) -> None:
         if self.h3 is None or request.h3 is None:
             return
 
         response = await process(self.handler.app, request)
+
+        if response.is_streaming:
+            await self.stream_h3(request.h3.stream_id, response)
+            return
 
         alt_body = self.h3.send(request.h3.stream_id, response)
 
@@ -334,6 +474,66 @@ class H3Protocol(QuicConnectionProtocol):
 
         else:
             self.transmit()
+
+    async def stream_h3(self, stream_id: int, response: Response) -> None:
+        if self.h3 is None:
+            return
+
+        self.h3.send_headers_only(stream_id, response)
+        self.transmit()
+
+        try:
+            async for chunk in response.body:
+                if chunk and self.h3 is not None:
+                    self.h3.send_chunk(stream_id, chunk, end_stream=False)
+                    self.transmit()
+
+        finally:
+            if self.h3 is not None:
+                self.h3.send_chunk(stream_id, b"", end_stream=True)
+                self.transmit()
+
+    async def ws_response_h3(self, upgrade: H3WSUpgrade) -> None:
+        if self.h3 is None:
+            return
+
+        self.h3.ws_accept(upgrade.stream_id)
+        self.transmit()
+
+        ws_transport = H3WebSocketTransport(self.h3, upgrade.stream_id, self)
+        ws = WebSocket(ws_transport, require_masking=False)
+
+        asyncio.create_task(self.ws_read_h3(upgrade.stream_id, ws))
+
+        try:
+            await self.handler.app.on_websocket(upgrade.request, ws)
+
+        except Exception:
+            pass
+
+        finally:
+            if not ws.closed:
+                await ws.close(1011)
+
+    async def ws_read_h3(self, stream_id: int, ws: WebSocket) -> None:
+        if self.h3 is None:
+            return
+
+        queue = self.h3.ws_streams.get(stream_id)
+        if queue is None:
+            return
+
+        buf = bytearray()
+        while True:
+            chunk = await queue.get()
+            if chunk is None:
+                ws.queue.put_nowait(None)
+                break
+
+            buf.extend(chunk)
+
+            for frame in parse_frames(buf):
+                ws.feed_frame(frame)
 
     async def send_file(self, stream_id: int, path: os.PathLike, file_range: tuple[int, int] | None = None) -> None:
         if self.h3 is None:

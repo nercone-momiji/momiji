@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import socket
 import ipaddress
+from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING, Literal
 from dataclasses import dataclass, field
 
@@ -35,7 +36,7 @@ class Request:
 
 @dataclass
 class Response:
-    body: bytes | os.PathLike | None = None
+    body: bytes | AsyncIterator[bytes] | os.PathLike | None = None
     status_code: int = 200
     headers: Headers = field(default_factory=lambda: Headers({}))
     content_type: str | None = None
@@ -48,6 +49,10 @@ class Response:
     @property
     def has_real_body(self) -> bool:
         return self.body is not None and isinstance(self.body, bytes)
+
+    @property
+    def is_streaming(self) -> bool:
+        return hasattr(self.body, "__aiter__")
 
 class Headers:
     def __init__(self, headers: dict[str, str]):
@@ -84,6 +89,9 @@ class Headers:
             self.headers[key.lower()].append(value)
         else:
             self.headers[key.lower()] = [value]
+
+    def remove(self, key: str) -> None:
+        self.headers.pop(key.lower(), None)
 
     def append_vary(self, header: str):
         vary = [v.strip() for v in self.get("Vary", "").split(",") if v.strip()]

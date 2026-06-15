@@ -5,6 +5,12 @@ import base64
 import hashlib
 import struct
 from enum import IntEnum
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class WriteTransport(Protocol):
+    def write(self, data: bytes) -> None: ...
+    def close(self) -> None: ...
 
 class Opcode(IntEnum):
     CONTINUATION = 0x0
@@ -78,15 +84,16 @@ def parse_frames(buf: bytearray) -> list[Frame]:
     return frames
 
 class WebSocket:
-    def __init__(self, transport: asyncio.Transport):
+    def __init__(self, transport: WriteTransport, *, require_masking: bool = True):
         self.transport = transport
+        self.require_masking = require_masking
         self.queue: asyncio.Queue[bytes | None] = asyncio.Queue()
         self.closed = False
         self.fragments: bytearray = bytearray()
         self.fragment_opcode: Opcode | None = None
 
     def feed_frame(self, frame: Frame) -> None:
-        if not frame.masked:
+        if self.require_masking and not frame.masked:
             self.close_transport(1002)
             return
 

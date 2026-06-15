@@ -92,18 +92,20 @@ class H1:
         return body
 
     @staticmethod
-    def build(response: Response) -> bytes | tuple[bytes, os.PathLike | None]:
+    def build_head(response: Response) -> bytes:
         try:
             phrase = HTTPStatus(response.status_code).phrase
         except ValueError:
             phrase = ""
-
         built = f"HTTP/1.1 {response.status_code}" + (f" {phrase}" if phrase else "") + "\r\n"
         for key, value in response.headers.items():
             built += f"{key}: {value}\r\n"
         built += "\r\n"
+        return built.encode("latin-1")
 
+    @staticmethod
+    def build(response: Response) -> bytes | tuple[bytes, os.PathLike | None]:
         if response.has_real_body:
-            return built.encode("latin-1") + response.body
+            return H1.build_head(response) + response.body
         else:
-            return built.encode("latin-1"), response.body
+            return H1.build_head(response), response.body
