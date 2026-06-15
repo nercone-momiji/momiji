@@ -39,7 +39,6 @@ class Response:
     status_code: int = 200
     headers: Headers = field(default_factory=lambda: Headers({}))
     content_type: str | None = None
-    protocol: Literal["HTTP/1.1", "HTTP/2.0", "HTTP/3.0"] | None = None
 
     compression: bool = True
     minification: bool = False
