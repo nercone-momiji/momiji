@@ -93,7 +93,7 @@ class TCPProtocol(asyncio.Protocol):
                     content_length_raw = value_b.strip()
 
             if b"chunked" in transfer_encoding_raw:
-                scan = H1._scan_chunked(bytes(self.buffer[body_start:]))
+                scan = H1.scan_chunked(bytes(self.buffer[body_start:]))
                 if scan is None:
                     return
                 consumed = body_start + scan[1]
