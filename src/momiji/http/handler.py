@@ -16,6 +16,7 @@ from .h2 import H2
 from .h3 import H3
 from .models import Listener, Request
 from .process import process
+from .websocket import WebSocket, compute_accept, parse_frames
 from ..tls import TLS, TLSInfo
 
 if TYPE_CHECKING:
@@ -43,6 +44,8 @@ class TCPProtocol(asyncio.Protocol):
         self.secure: bool = False
         self.tls: TLSInfo | None = None
         self.keep_alive: bool = True
+        self.ws: WebSocket | None = None
+        self.ws_buffer: bytearray = bytearray()
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = transport
@@ -66,6 +69,12 @@ class TCPProtocol(asyncio.Protocol):
 
     def data_received(self, data: bytes) -> None:
         if self.transport is None:
+            return
+
+        if self.ws is not None:
+            self.ws_buffer.extend(data)
+            for frame in parse_frames(self.ws_buffer):
+                self.ws.feed_frame(frame)
             return
 
         if self.h2 is None and "http/1.1" not in self.handler.config.protocols:
@@ -143,6 +152,16 @@ class TCPProtocol(asyncio.Protocol):
         if self.transport is None:
             return
 
+        upgrade = (request.headers.get("Upgrade", "")).lower().strip()
+        connection = (request.headers.get("Connection", "")).lower()
+
+        ws_key = (request.headers.get("Sec-WebSocket-Key", "")).strip()
+        ws_version = (request.headers.get("Sec-WebSocket-Version", "")).strip()
+
+        if upgrade == "websocket" and "upgrade" in connection and ws_key and ws_version == "13":
+            await self.upgrade_websocket(request, ws_key)
+            return
+
         response = await process(self.handler.app, request)
 
         if "h3" in self.handler.config.protocols and self.handler.config.bind_quic:
@@ -156,7 +175,7 @@ class TCPProtocol(asyncio.Protocol):
             self.transport.write(head)
 
             if alt_body is not None:
-                await self.send_file_h1(alt_body)
+                await self.send_file_h1(alt_body, response.file_range)
 
         else:
             self.transport.write(result)
@@ -164,19 +183,58 @@ class TCPProtocol(asyncio.Protocol):
         if not self.keep_alive:
             self.transport.close()
 
-    async def send_file_h1(self, path: os.PathLike) -> None:
+    async def upgrade_websocket(self, request: Request, ws_key: str) -> None:
+        if self.transport is None:
+            return
+        accept = compute_accept(ws_key)
+        self.transport.write(
+            b"HTTP/1.1 101 Switching Protocols\r\n"
+            b"Upgrade: websocket\r\n"
+            b"Connection: Upgrade\r\n"
+            b"Sec-WebSocket-Accept: " + accept.encode() + b"\r\n"
+            b"\r\n"
+        )
+        ws = WebSocket(self.transport)
+        self.ws = ws
+        self.ws_buffer = bytearray()
+        asyncio.create_task(self.run_websocket(request, ws))
+
+    async def run_websocket(self, request: Request, ws: WebSocket) -> None:
+        try:
+            await self.handler.app.on_websocket(request, ws)
+        except Exception:
+            pass
+        finally:
+            if not ws.closed:
+                await ws.close(1011)
+
+    async def send_file_h1(self, path: os.PathLike, file_range: tuple[int, int] | None = None) -> None:
         if self.transport is None:
             return
         loop = asyncio.get_running_loop()
 
         def read_chunks() -> list[bytes]:
             chunks: list[bytes] = []
+
             with open(os.fspath(path), "rb") as fp:
-                while True:
-                    chunk = fp.read(65536)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
+                if file_range is not None:
+                    start, end = file_range
+                    fp.seek(start)
+                    remaining = end - start + 1
+                    while remaining > 0:
+                        chunk = fp.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+
+                else:
+                    while True:
+                        chunk = fp.read(65536)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+
             return chunks
 
         for chunk in await loop.run_in_executor(None, read_chunks):
@@ -198,21 +256,35 @@ class TCPProtocol(asyncio.Protocol):
             self.transport.write(out)
 
         if alt_body is not None:
-            await self.send_file_h2(request.h2.stream_id, alt_body)
+            await self.send_file_h2(request.h2.stream_id, alt_body, response.file_range)
 
-    async def send_file_h2(self, stream_id: int, path: os.PathLike) -> None:
+    async def send_file_h2(self, stream_id: int, path: os.PathLike, file_range: tuple[int, int] | None = None) -> None:
         if self.transport is None or self.h2 is None:
             return
         loop = asyncio.get_running_loop()
 
         def read_chunks() -> list[bytes]:
             chunks: list[bytes] = []
+
             with open(os.fspath(path), "rb") as fp:
-                while True:
-                    chunk = fp.read(65536)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
+                if file_range is not None:
+                    start, end = file_range
+                    fp.seek(start)
+                    remaining = end - start + 1
+                    while remaining > 0:
+                        chunk = fp.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+
+                else:
+                    while True:
+                        chunk = fp.read(65536)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+
             return chunks
 
         chunks = await loop.run_in_executor(None, read_chunks)
@@ -258,24 +330,38 @@ class H3Protocol(QuicConnectionProtocol):
         alt_body = self.h3.send(request.h3.stream_id, response)
 
         if alt_body is not None:
-            await self.send_file(request.h3.stream_id, alt_body)
+            await self.send_file(request.h3.stream_id, alt_body, response.file_range)
 
         else:
             self.transmit()
 
-    async def send_file(self, stream_id: int, path: os.PathLike) -> None:
+    async def send_file(self, stream_id: int, path: os.PathLike, file_range: tuple[int, int] | None = None) -> None:
         if self.h3 is None:
             return
         loop = asyncio.get_running_loop()
 
         def read_chunks() -> list[bytes]:
             chunks: list[bytes] = []
+
             with open(os.fspath(path), "rb") as fp:
-                while True:
-                    chunk = fp.read(65536)
-                    if not chunk:
-                        break
-                    chunks.append(chunk)
+                if file_range is not None:
+                    start, end = file_range
+                    fp.seek(start)
+                    remaining = end - start + 1
+                    while remaining > 0:
+                        chunk = fp.read(min(65536, remaining))
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+
+                else:
+                    while True:
+                        chunk = fp.read(65536)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+
             return chunks
 
         chunks = await loop.run_in_executor(None, read_chunks)

@@ -4,5 +4,6 @@ from .h3 import H3, H3Info
 from .models import TLSInfo, Request, Response, Listener, Headers
 from .handler import Handler
 from .process import process, minimize, compress
+from .websocket import WebSocket
 
-__all__ = ["H1", "H2", "H3", "H2Info", "H3Info", "TLSInfo", "Request", "Response", "Listener", "Headers", "Handler", "process", "minimize", "compress"]
+__all__ = ["H1", "H2", "H3", "H2Info", "H3Info", "TLSInfo", "Request", "Response", "Listener", "Headers", "Handler", "process", "minimize", "compress", "WebSocket"]

@@ -135,6 +135,40 @@ def parse_accept_encoding(value: str) -> dict[str, float]:
 
     return result
 
+def parse_range(value: str, total: int) -> tuple[int, int] | None:
+    if not value.startswith("bytes="):
+        return None
+    spec = value[6:].split(",")[0].strip()
+
+    if spec.startswith("-"):
+        try:
+            suffix = int(spec[1:])
+        except ValueError:
+            return None
+        if suffix <= 0 or total == 0:
+            return None
+        return (max(0, total - suffix), total - 1)
+
+    dash = spec.find("-")
+    if dash == -1:
+        return None
+
+    start_s, end_s = spec[:dash].strip(), spec[dash + 1:].strip()
+    try:
+        start = int(start_s)
+    except ValueError:
+        return None
+
+    end = int(end_s) if end_s else total - 1
+    try:
+        end = int(end_s) if end_s else total - 1
+    except ValueError:
+        return None
+    if start > end or start >= total:
+        return None
+
+    return (start, min(end, total - 1))
+
 async def process(app: App | None, request: Request, response: Response | None = None) -> Response:
     if response is None:
         try:
@@ -143,14 +177,36 @@ async def process(app: App | None, request: Request, response: Response | None =
                 result = await result
             response = result
         except Exception:
-            response = Response(b"Internal Server Error", status_code=500, compression=False, minification=False, protocol=request.protocol)
+            response = Response(b"Internal Server Error", status_code=500, compression=False, minification=False)
 
     response.headers.set("Server", "Momiji", override=False)
     response.headers.set("Content-Length", "0")
 
     if response.has_real_body:
         response.body = await minimize(response) or response.body
+
+        range_header = request.headers.get("Range", "")
+        if (range_header and request.method in ("GET", "HEAD") and response.status_code == 200):
+            total = len(response.body)
+            parsed = parse_range(range_header, total)
+
+            response.headers.set("Accept-Ranges", "bytes")
+
+            if parsed is None:
+                response.status_code = 416
+                response.headers.set("Content-Range", f"bytes */{total}")
+                response.body = b""
+                response.headers.set("Content-Length", "0")
+                return response
+
+            start, end = parsed
+            response.body = response.body[start:end + 1]
+            response.status_code = 206
+            response.headers.set("Content-Range", f"bytes {start}-{end}/{total}")
+            response.compression = False
+
         response.body = await compress(response, parse_accept_encoding(request.headers.get("Accept-Encoding", ""))) or response.body
+
         response.headers.set("Content-Type", response.content_type or response.headers.get("Content-Type") or "application/octet-stream")
         response.headers.set("Content-Length", str(len(response.body)))
 
@@ -160,10 +216,30 @@ async def process(app: App | None, request: Request, response: Response | None =
         except OSError:
             mime = None
 
-        response.headers.set("Content-Type", response.content_type or response.headers.get("Content-Type") or mime or "application/octet-stream")
-        response.headers.set("Content-Length", str(os.path.getsize(os.fspath(response.body))))
+        total = os.path.getsize(os.fspath(response.body))
 
-    if response.headers.get("Content-Type", "").startswith("text/") and not "charset=" in response.headers.get("Content-Type", ""):
+        response.headers.set("Accept-Ranges", "bytes")
+        response.headers.set("Content-Type", response.content_type or response.headers.get("Content-Type") or mime or "application/octet-stream")
+
+        range_header = request.headers.get("Range", "")
+        if (range_header and request.method in ("GET", "HEAD") and response.status_code == 200):
+            parsed = parse_range(range_header, total)
+            if parsed is None:
+                response.status_code = 416
+                response.headers.set("Content-Range", f"bytes */{total}")
+                response.body = None
+                response.headers.set("Content-Length", "0")
+                return response
+            start, end = parsed
+            response.file_range = (start, end)
+            response.status_code = 206
+            response.headers.set("Content-Range", f"bytes {start}-{end}/{total}")
+            response.headers.set("Content-Length", str(end - start + 1))
+
+        else:
+            response.headers.set("Content-Length", str(total))
+
+    if response.headers.get("Content-Type", "").startswith("text/") and "charset=" not in response.headers.get("Content-Type", ""):
         response.headers.set("Content-Type", response.headers.get("Content-Type", "") + "; charset=utf-8")
 
     return response

@@ -124,6 +124,8 @@ class Server:
         for handler in handlers:
             await handler.start()
 
+        await self.app.on_start()
+
         loop = asyncio.get_running_loop()
         stop = loop.create_future()
 
@@ -135,5 +137,8 @@ class Server:
         finally:
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.remove_signal_handler(sig)
+
+            await self.app.on_stop()
+
             for handler in handlers:
                 await handler.stop()

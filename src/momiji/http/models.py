@@ -43,6 +43,8 @@ class Response:
     compression: bool = True
     minification: bool = False
 
+    file_range: tuple[int, int] | None = field(default=None)
+
     @property
     def has_real_body(self) -> bool:
         return self.body is not None and isinstance(self.body, bytes)
