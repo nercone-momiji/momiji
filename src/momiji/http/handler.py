@@ -77,33 +77,44 @@ class TCPProtocol(asyncio.Protocol):
             if head_end == -1:
                 return
 
-            try:
-                request = H1.parse(bytes(self.buffer), client=self.client, scheme=self.scheme, secure=self.secure, tls=self.tls)
-            except ValueError:
-                self.transport.close()
-                return
-
             body_start = head_end + 4
-            content_length = request.headers.get("Content-Length")
-            transfer_encoding = (request.headers.get("Transfer-Encoding") or "").lower()
 
-            if "chunked" in transfer_encoding:
-                consumed = len(self.buffer)
+            transfer_encoding_raw = b""
+            content_length_raw: bytes | None = None
+            for line in bytes(self.buffer[:head_end]).split(b"\r\n")[1:]:
+                name_b, sep_b, value_b = line.partition(b":")
+                if not sep_b:
+                    continue
+                name_lower = name_b.strip().lower()
+                if name_lower == b"transfer-encoding":
+                    transfer_encoding_raw = value_b.strip().lower()
+                elif name_lower == b"content-length":
+                    content_length_raw = value_b.strip()
 
-            elif content_length is not None:
+            if b"chunked" in transfer_encoding_raw:
+                scan = H1._scan_chunked(bytes(self.buffer[body_start:]))
+                if scan is None:
+                    return
+                consumed = body_start + scan[1]
+
+            elif content_length_raw is not None:
                 try:
-                    expected = int(content_length)
+                    expected = int(content_length_raw)
                 except ValueError:
                     self.transport.close()
                     return
-
                 if len(self.buffer) - body_start < expected:
                     return
-
                 consumed = body_start + expected
 
             else:
                 consumed = body_start
+
+            try:
+                request = H1.parse(bytes(self.buffer[:consumed]), client=self.client, scheme=self.scheme, secure=self.secure, tls=self.tls)
+            except (ValueError, UnicodeDecodeError):
+                self.transport.close()
+                return
 
             del self.buffer[:consumed]
 

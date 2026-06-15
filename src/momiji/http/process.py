@@ -4,6 +4,7 @@ import os
 import gzip
 import zlib
 import inspect
+import mimetypes
 import zstandard
 import brotlicffi
 
@@ -149,18 +150,18 @@ async def process(app: App | None, request: Request, response: Response | None =
             response = Response(b"Internal Server Error", status_code=500, compression=False, minification=False, protocol=request.protocol)
 
     response.headers.set("Server", "Momiji", override=False)
-    
-    response.headers.set("Content-Type", "application/octet-stream", override=False)
     response.headers.set("Content-Length", "0")
 
     if response.has_real_body:
         response.body = await minimize(response) or response.body
         response.body = await compress(response, parse_accept_encoding(request.headers.get("accept-encoding", ""))) or response.body
-
+        response.headers.set("Content-Type", "application/octet-stream", override=False)
         response.headers.set("Content-Length", str(len(response.body)))
 
     elif response.body is not None:
         try:
+            mime, _ = mimetypes.guess_type(os.fspath(response.body))
+            response.headers.set("Content-Type", mime or "application/octet-stream", override=False)
             response.headers.set("Content-Length", str(os.path.getsize(os.fspath(response.body))))
         except OSError:
             pass

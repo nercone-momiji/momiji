@@ -62,7 +62,7 @@ class H2:
                 stream = self.streams.get(event.stream_id)
                 if stream is not None:
                     stream.body.extend(event.data)
-                    self.connection.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
+                self.connection.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
                 if event.stream_ended and event.stream_id in self.streams:
                     completed.append(self.finalize(event.stream_id, client, secure, tls))
 
