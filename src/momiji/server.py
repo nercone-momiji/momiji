@@ -11,9 +11,9 @@ from .config import Config
 from .http import Listener, Handler
 
 class Server:
-    def __init__(self, app: App, middlewares: list[Middleware] = [], config: Config | None = None):
+    def __init__(self, app: App, middlewares: list[Middleware] | None = None, config: Config | None = None):
         self.app = app
-        self.middlewares = middlewares
+        self.middlewares = middlewares if middlewares is not None else []
         self.config = config or Config()
 
     def bind_unix(self, path: os.PathLike) -> socket.socket:

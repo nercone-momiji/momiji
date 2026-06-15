@@ -101,7 +101,7 @@ async def compress_stream_deflate(body: AsyncIterator[bytes]) -> AsyncIterator[b
 
 async def minimize(response: Response) -> bytes | None:
     if response.has_real_body and response.minification:
-        content_type = response.headers.get("Content-Type", "")
+        content_type = response.content_type or response.headers.get("Content-Type", "") or ""
         try:
             if content_type.startswith("text/html"):
                 return await minimize_html(response.body)
@@ -218,7 +218,6 @@ def parse_range(value: str, total: int) -> tuple[int, int] | None:
     except ValueError:
         return None
 
-    end = int(end_s) if end_s else total - 1
     try:
         end = int(end_s) if end_s else total - 1
     except ValueError:
