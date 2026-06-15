@@ -6,12 +6,12 @@ import socket
 import uvloop
 import asyncio
 
-from .app import App
+from .app import App, Middleware
 from .config import Config
 from .http import Listener, Handler
 
 class Server:
-    def __init__(self, app: App, config: Config | None = None):
+    def __init__(self, app: App, middlewares: list[Middleware], config: Config | None = None):
         self.app = app
         self.config = config or Config()
 
