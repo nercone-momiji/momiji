@@ -1,10 +1,11 @@
+from typing import Awaitable
 from .http import Request, Response, WebSocket
 
 class App:
     def __init__(self):
         pass
 
-    def __call__(self, request: Request) -> Response:
+    def __call__(self, request: Request) -> Response | Awaitable[Response]:
         return Response("Hello, World! This is Response from Default Momiji Application.".encode(), content_type="text/plain")
 
     async def on_start(self):
