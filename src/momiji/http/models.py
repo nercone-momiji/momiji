@@ -6,23 +6,14 @@ import ipaddress
 from typing import Literal
 from dataclasses import dataclass, field
 
-from ..tls import Group, Cipher
+from .h2 import H2Info
+from .h3 import H3Info
+from ..tls import TLSInfo
 
 @dataclass
 class Listener:
     sock: socket.socket
     kind: Literal["http", "https", "quic", "unix"]
-
-@dataclass
-class TLSInfo:
-    version: Literal["SSLv3.0", "TLSv1.0", "TLSv1.1", "TLSv1.2", "TLSv1.3"] | None
-    group: Group | None
-    cipher: Cipher | None
-
-@dataclass
-class QUICInfo:
-    connection_id: bytes
-    stream_id: int
 
 @dataclass
 class Request:
@@ -36,8 +27,9 @@ class Request:
     headers: Headers
     body: bytes | None
 
+    h2: H2Info | None
+    h3: H3Info | None
     tls: TLSInfo | None
-    quic: QUICInfo | None
 
 @dataclass
 class Response:

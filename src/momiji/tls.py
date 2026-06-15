@@ -2,6 +2,7 @@ import ssl
 import ctypes
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
+from dataclasses import dataclass, field
 
 if TYPE_CHECKING:
     from .config import Config
@@ -259,29 +260,69 @@ GROUP_MAP: dict[str, Group] = {
 
 CIPHER_MAP: dict[str, Cipher] = {c.value: c for c in Cipher}
 
-def set_ssl_groups(ctx: ssl.SSLContext, groups: str):
-    if hasattr(ctx, 'set_groups'):
-        ctx.set_groups(groups)
-        return
-    try:
-        libssl = ctypes.CDLL(None)
-        libssl.SSL_CTX_set1_groups_list.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-        libssl.SSL_CTX_set1_groups_list.restype = ctypes.c_int
-        ptr_size = ctypes.sizeof(ctypes.c_void_p)
-        ssl_ctx_ptr = ctypes.c_void_p.from_address(id(ctx) + 2 * ptr_size).value
-        if ssl_ctx_ptr:
-            libssl.SSL_CTX_set1_groups_list(ssl_ctx_ptr, groups.encode('ascii'))
-    except Exception:
-        pass
+@dataclass
+class TLSInfo:
+    version: Literal["SSLv3.0", "TLSv1.0", "TLSv1.1", "TLSv1.2", "TLSv1.3"] | None
+    group: Group | None
+    cipher: Cipher | None
 
-def create_ssl_context(config: 'Config') -> ssl.SSLContext:
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    ctx.load_cert_chain(config.certfile, config.keyfile)
-    ctx.set_ciphers(':'.join(c.value for c in config.ciphers))
-    https_alpn = [p for p in config.alpn_protocols if p != 'h3']
-    if https_alpn:
-        ctx.set_alpn_protocols(https_alpn)
-    groups_str = ':'.join(g.value for g in config.groups)
-    set_ssl_groups(ctx, groups_str)
-    return ctx
+@dataclass
+class TLSConfig:
+    certfile: str | None = None
+    keyfile: str | None = None
+    ciphers: list[Cipher] = field(default_factory=lambda: [Cipher.ECDHE_ECDSA_AES128_GCM_SHA256, Cipher.ECDHE_ECDSA_AES256_GCM_SHA384, Cipher.ECDHE_ECDSA_CHACHA20_POLY1305])
+    groups: list[Group] = field(default_factory=lambda: [Group.X25519MLKEM768, Group.SECP384R1MLKEM1024, Group.SECP256R1MLKEM768, Group.MLKEM1024, Group.MLKEM768, Group.X25519, Group.prime256v1, Group.secp384r1])
+    minimum_version: ssl.TLSVersion = ssl.TLSVersion.TLSv1_2
+
+class TLS:
+    @staticmethod
+    def extract_tls_info(ssl_object: ssl.SSLObject | None) -> TLSInfo | None:
+        if ssl_object is None:
+            return None
+
+        if hasattr(ssl_object, 'version'):
+            version = VERSION_MAP.get(ssl_object.version() or "")
+        else:
+            version = None
+
+        if hasattr(ssl_object, 'cipher'):
+            cipher = CIPHER_MAP.get(ssl_object.cipher()[0])
+        else:
+            cipher = None
+
+        if hasattr(ssl_object, 'group'):
+            group = GROUP_MAP.get(ssl_object.group())
+        else:
+            group = None
+
+        return TLSInfo(version=version, cipher=cipher, group=group)
+
+    @staticmethod
+    def set_ssl_groups(ctx: ssl.SSLContext, groups: str):
+        if hasattr(ctx, 'set_groups'):
+            ctx.set_groups(groups)
+            return
+
+        try:
+            libssl = ctypes.CDLL(None)
+            libssl.SSL_CTX_set1_groups_list.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            libssl.SSL_CTX_set1_groups_list.restype = ctypes.c_int
+            ptr_size = ctypes.sizeof(ctypes.c_void_p)
+            ssl_ctx_ptr = ctypes.c_void_p.from_address(id(ctx) + 2 * ptr_size).value
+            if ssl_ctx_ptr:
+                libssl.SSL_CTX_set1_groups_list(ssl_ctx_ptr, groups.encode('ascii'))
+        except Exception:
+            pass
+
+    @staticmethod
+    def create_ssl_context(config: Config) -> ssl.SSLContext:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = config.tls.minimum_version
+        ctx.load_cert_chain(config.tls.certfile, config.tls.keyfile)
+        ctx.set_ciphers(':'.join(c.value for c in config.tls.ciphers))
+        https_alpn = [p for p in config.protocols if p != 'h3']
+        if https_alpn:
+            ctx.set_alpn_protocols(https_alpn)
+        groups_str = ':'.join(g.value for g in config.tls.groups)
+        TLS.set_ssl_groups(ctx, groups_str)
+        return ctx

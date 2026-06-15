@@ -12,10 +12,10 @@ import rjsmin
 import rcssmin
 from scour import scour
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 from async_lru import alru_cache
 
-from .models import Request, Response, Headers
+from .models import Request, Response
 
 if TYPE_CHECKING:
     from ..app import App
@@ -73,13 +73,8 @@ async def minimize(response: Response) -> bytes | None:
     return None
 
 async def compress(response: Response, accepted_encodings: dict[str, float]) -> bytes | None:
-    if not (response.has_real_body and response.compression and accepted_encodings):
+    if not (response.has_real_body and response.compression and len(accepted_encodings) > 0):
         return None
-
-    if response.headers.get("Content-Encoding"):
-        return None
-
-    star_q = accepted_encodings.get("*", None)
 
     candidates: list[tuple[str, callable, int]] = [
         ("zstd", compress_zstd, 0),
@@ -87,6 +82,8 @@ async def compress(response: Response, accepted_encodings: dict[str, float]) -> 
         ("gzip", compress_gzip, 2),
         ("deflate", compress_deflate, 3)
     ]
+
+    star_q = accepted_encodings.get("*", None)
 
     scored: list[tuple[float, int, str, callable]] = []
     for encoding, fn, priority in candidates:
@@ -152,26 +149,20 @@ async def process(app: App | None, request: Request, response: Response | None =
             response = Response(b"Internal Server Error", status_code=500, compression=False, minification=False, protocol=request.protocol)
 
     response.headers.set("Server", "Momiji", override=False)
+    
+    response.headers.set("Content-Type", "application/octet-stream", override=False)
+    response.headers.set("Content-Length", "0")
 
     if response.has_real_body:
         response.body = await minimize(response) or response.body
         response.body = await compress(response, parse_accept_encoding(request.headers.get("accept-encoding", ""))) or response.body
 
-        response.headers.set("Content-Type", "application/octet-stream", override=False)
         response.headers.set("Content-Length", str(len(response.body)))
 
-    elif response.body is None:
-        response.headers.set("Content-Length", "0")
-
-    else:
+    elif response.body is not None:
         try:
-            size = os.path.getsize(os.fspath(response.body))
-            response.headers.set("Content-Length", str(size), override=False)
-            response.headers.set("Content-Type", "application/octet-stream", override=False)
+            response.headers.set("Content-Length", str(os.path.getsize(os.fspath(response.body))), override=False)
         except OSError:
             pass
 
     return response
-
-async def error_response(body: bytes, status_code: int, protocol: Literal["HTTP/1.1", "HTTP/2.0", "HTTP/3.0"], headers: dict[str, str] = {}) -> Response:
-    return process(app=None, response=Response(body, status_code=status_code, compression=False, minification=False, protocol=protocol, headers=Headers(headers)))
