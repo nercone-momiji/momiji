@@ -19,7 +19,7 @@ from momiji import Server, App, Response
 
 class MyApp(App):
     def __call__(self, request):
-        return Response("Hello, World!".encode())
+        return Response("Hello, World!".encode(), content_type="text/plain")
 
 if __name__ == "__main__":
     server = Server(MyApp())

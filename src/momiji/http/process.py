@@ -104,11 +104,8 @@ async def compress(response: Response, accepted_encodings: dict[str, float]) -> 
             continue
 
         response.headers.set("Content-Encoding", encoding)
-        existing_vary = response.headers.get("Vary", "")
-        vary_tokens = [v.strip() for v in existing_vary.split(",") if v.strip()]
-        if not any(v.lower() == "accept-encoding" for v in vary_tokens):
-            vary_tokens.append("Accept-Encoding")
-        response.headers.set("Vary", ", ".join(vary_tokens))
+        response.headers.append_vary("Accept-Encoding")
+
         return compressed
 
     return None
@@ -154,16 +151,20 @@ async def process(app: App | None, request: Request, response: Response | None =
 
     if response.has_real_body:
         response.body = await minimize(response) or response.body
-        response.body = await compress(response, parse_accept_encoding(request.headers.get("accept-encoding", ""))) or response.body
-        response.headers.set("Content-Type", "application/octet-stream", override=False)
+        response.body = await compress(response, parse_accept_encoding(request.headers.get("Accept-Encoding", ""))) or response.body
+        response.headers.set("Content-Type", response.content_type or response.headers.get("Content-Type") or "application/octet-stream")
         response.headers.set("Content-Length", str(len(response.body)))
 
     elif response.body is not None:
         try:
             mime, _ = mimetypes.guess_type(os.fspath(response.body))
-            response.headers.set("Content-Type", mime or "application/octet-stream", override=False)
-            response.headers.set("Content-Length", str(os.path.getsize(os.fspath(response.body))))
         except OSError:
-            pass
+            mime = None
+
+        response.headers.set("Content-Type", response.content_type or response.headers.get("Content-Type") or mime or "application/octet-stream")
+        response.headers.set("Content-Length", str(os.path.getsize(os.fspath(response.body))))
+
+    if response.headers.get("Content-Type", "").startswith("text/") and not "charset=" in response.headers.get("Content-Type", ""):
+        response.headers.set("Content-Type", response.headers.get("Content-Type", "") + "; charset=utf-8")
 
     return response

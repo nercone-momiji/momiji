@@ -5,4 +5,4 @@ class App:
         pass
 
     def __call__(self, request: Request) -> Response:
-        return Response("Hello, World! This is Response from Default Momiji Application.".encode())
+        return Response("Hello, World! This is Response from Default Momiji Application.".encode(), content_type="text/plain")
