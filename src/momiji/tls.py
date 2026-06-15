@@ -221,16 +221,16 @@ class Cipher(Enum):
     SRP_RSA_AES_128_CBC_SHA = "SRP-RSA-AES-128-CBC-SHA"
     SRP_RSA_AES_256_CBC_SHA = "SRP-RSA-AES-256-CBC-SHA"
 
-    # TLS
+    # TLS 1.3
     TLS_AES_128_GCM_SHA256       = "TLS_AES_128_GCM_SHA256"
     TLS_AES_256_GCM_SHA384       = "TLS_AES_256_GCM_SHA384"
     TLS_CHACHA20_POLY1305_SHA256 = "TLS_CHACHA20_POLY1305_SHA256"
 
-VERSION_MAP: dict[str, Literal["1.0", "1.1", "1.2", "1.3"]] = {
-    "TLSv1":   "1.0",
-    "TLSv1.1": "1.1",
-    "TLSv1.2": "1.2",
-    "TLSv1.3": "1.3"
+VERSION_MAP: dict[str, Literal["TLSv1.0", "TLSv1.1", "TLSv1.2", "TLSv1.3"]] = {
+    "TLSv1":   "TLSv1.0",
+    "TLSv1.1": "TLSv1.1",
+    "TLSv1.2": "TLSv1.2",
+    "TLSv1.3": "TLSv1.3"
 }
 
 GROUP_MAP: dict[str, Group] = {
@@ -264,7 +264,7 @@ CIPHER_MAP: dict[str, Cipher] = {c.value: c for c in Cipher}
 
 @dataclass
 class TLSInfo:
-    version: Literal["SSLv3.0", "TLSv1.0", "TLSv1.1", "TLSv1.2", "TLSv1.3"] | None
+    version: Literal["TLSv1.0", "TLSv1.1", "TLSv1.2", "TLSv1.3"] | None
     group: Group | None
     cipher: Cipher | None
 
@@ -300,31 +300,82 @@ class TLS:
         return TLSInfo(version=version, cipher=cipher, group=group)
 
     @staticmethod
-    def set_ssl_groups(ctx: ssl.SSLContext, groups: str):
+    def set_ssl_groups(ctx: ssl.SSLContext, groups: list[Group]):
         if hasattr(ctx, 'set_groups'):
-            ctx.set_groups(groups)
+            ctx.set_groups(":".join([group.value for group in groups]))
             return
 
         try:
-            libssl = ctypes.CDLL(None)
+            libssl = ctypes.CDLL('libssl.so.3')
             libssl.SSL_CTX_set1_groups_list.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             libssl.SSL_CTX_set1_groups_list.restype = ctypes.c_int
             ptr_size = ctypes.sizeof(ctypes.c_void_p)
             ssl_ctx_ptr = ctypes.c_void_p.from_address(id(ctx) + 2 * ptr_size).value
             if ssl_ctx_ptr:
-                libssl.SSL_CTX_set1_groups_list(ssl_ctx_ptr, groups.encode('ascii'))
+                libssl.SSL_CTX_set1_groups_list(ssl_ctx_ptr, ":".join([group.value for group in groups]).encode('ascii'))
         except Exception:
             pass
+
+    @staticmethod
+    def set_ssl_ciphers_tls12(ctx: ssl.SSLContext, ciphers: list[Cipher]):
+        if hasattr(ctx, 'set_ciphers') and ciphers:
+            ctx.set_ciphers(":".join([cipher.value for cipher in ciphers]))
+            return
+
+        try:
+            libssl = ctypes.CDLL('libssl.so.3')
+            libssl.SSL_CTX_set_cipher_list.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            libssl.SSL_CTX_set_cipher_list.restype = ctypes.c_int
+            ptr_size = ctypes.sizeof(ctypes.c_void_p)
+            ssl_ctx_ptr = ctypes.c_void_p.from_address(id(ctx) + 2 * ptr_size).value
+            if ssl_ctx_ptr:
+                libssl.SSL_CTX_set_cipher_list(ssl_ctx_ptr, ":".join([cipher.value for cipher in ciphers]).encode('ascii'))
+        except Exception:
+            pass
+
+    @staticmethod
+    def set_ssl_ciphers_tls13(ctx: ssl.SSLContext, ciphers: list[Cipher]):
+        if hasattr(ctx, 'set_ciphersuites') and ciphers:
+            ctx.set_ciphersuites(":".join([cipher.value for cipher in ciphers]))
+            return
+
+        try:
+            libssl = ctypes.CDLL('libssl.so.3')
+            libssl.SSL_CTX_set_ciphersuites.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+            libssl.SSL_CTX_set_ciphersuites.restype = ctypes.c_int
+            ptr_size = ctypes.sizeof(ctypes.c_void_p)
+            ssl_ctx_ptr = ctypes.c_void_p.from_address(id(ctx) + 2 * ptr_size).value
+            if ssl_ctx_ptr:
+                libssl.SSL_CTX_set_ciphersuites(ssl_ctx_ptr, ":".join([cipher.value for cipher in ciphers]).encode('ascii'))
+        except Exception:
+            pass
+
+    @staticmethod
+    def set_ssl_ciphers(ctx: ssl.SSLContext, ciphers: list[Cipher]):
+        tls12: list[Cipher] = []
+        tls13: list[Cipher] = []
+
+        for cipher in ciphers:
+            if cipher.value.startswith("TLS_"):
+                tls13.append(cipher)
+            else:
+                tls12.append(cipher)
+
+        TLS.set_ssl_ciphers_tls12(ctx, tls12)
+        TLS.set_ssl_ciphers_tls13(ctx, tls13)
 
     @staticmethod
     def create_ssl_context(config: Config) -> ssl.SSLContext:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = config.tls.minimum_version
-        ctx.load_cert_chain(config.tls.certfile, config.tls.keyfile)
-        ctx.set_ciphers(':'.join(c.value for c in config.tls.ciphers))
-        https_alpn = [p for p in config.protocols if p != 'h3']
-        if https_alpn:
-            ctx.set_alpn_protocols(https_alpn)
-        groups_str = ':'.join(g.value for g in config.tls.groups)
-        TLS.set_ssl_groups(ctx, groups_str)
+
+        alpn = [p for p in config.protocols if p != "h3"]
+        if alpn:
+            ctx.set_alpn_protocols(alpn)
+
+        if config.tls.certfile and config.tls.keyfile:
+            ctx.load_cert_chain(config.tls.certfile, config.tls.keyfile)
+
+        TLS.set_ssl_groups(ctx, config.tls.groups)
+        TLS.set_ssl_ciphers(ctx, config.tls.ciphers)
         return ctx
