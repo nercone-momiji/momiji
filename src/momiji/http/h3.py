@@ -190,6 +190,7 @@ class H3Protocol(QuicConnectionProtocol):
             elif kind == STREAM_PUSH:
                 self._quic.stop_stream(stream_id, H3_STREAM_CREATION_ERROR)
                 self.transmit()
+                self.uni_streams.pop(stream_id, None)
                 return
 
         if stream.kind == STREAM_CONTROL:
@@ -369,23 +370,39 @@ class H3Protocol(QuicConnectionProtocol):
 
         if body is None:
             self._quic.send_stream_data(stream_id, frames, end_stream=True)
+            self.transmit()
+            return
 
-        else:
-            if not isinstance(body, (bytes, bytearray)):
-                loop = asyncio.get_event_loop()
-                try:
-                    fd = await loop.run_in_executor(None, lambda: open(body, "rb"))
-                    try:
-                        body = await loop.run_in_executor(None, fd.read)
-                    finally:
-                        await loop.run_in_executor(None, fd.close)
-                except OSError:
-                    body = b""
+        self._quic.send_stream_data(stream_id, frames, end_stream=False)
 
-            self._quic.send_stream_data(stream_id, frames, end_stream=False)
+        if isinstance(body, (bytes, bytearray)):
             self._quic.send_stream_data(stream_id, encode_frame(FRAME_DATA, bytes(body)), end_stream=True)
+            self.transmit()
+            return
 
-        self.transmit()
+        loop = asyncio.get_event_loop()
+        try:
+            fd = await loop.run_in_executor(None, lambda: open(body, "rb"))
+        except OSError:
+            self._quic.send_stream_data(stream_id, encode_frame(FRAME_DATA, b""), end_stream=True)
+            self.transmit()
+            return
+
+        try:
+            pending = await loop.run_in_executor(None, fd.read, 65536)
+            if not pending:
+                self._quic.send_stream_data(stream_id, encode_frame(FRAME_DATA, b""), end_stream=True)
+                self.transmit()
+                return
+
+            while pending:
+                next_chunk = await loop.run_in_executor(None, fd.read, 65536)
+                is_last = not next_chunk
+                self._quic.send_stream_data(stream_id, encode_frame(FRAME_DATA, pending), end_stream=is_last)
+                self.transmit()
+                pending = next_chunk
+        finally:
+            await loop.run_in_executor(None, fd.close)
 
 def create_protocol(app: "App", config: "Config"):
     def factory(quic, stream_handler=None):

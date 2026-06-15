@@ -24,7 +24,9 @@ class CookieItem:
         return f"CookieItem(name={self.name!r}, value={self.value!r})"
 
     def part(self) -> str:
-        parts = [f"{self.name}={self.value}"]
+        safe_name = str(self.name).replace(";", "").replace("=", "").replace("\r", "").replace("\n", "")
+        safe_value = str(self.value).replace(";", "").replace("\r", "").replace("\n", "")
+        parts = [f"{safe_name}={safe_value}"]
         if self.path is not None:
             parts.append(f"Path={self.path}")
         if self.domain is not None:

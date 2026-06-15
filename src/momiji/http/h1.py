@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from .models import Response, TLSInfo
 from .parse import parse, ParseError
-from .process import process
+from .process import process, error_response
 
 if TYPE_CHECKING:
     from ..app import App
@@ -47,14 +47,17 @@ def serialize_response(response: Response) -> bytes | tuple[bytes, os.PathLike |
         built += f"{safe_name}: {safe_value}\r\n"
     built += "\r\n"
 
+    head_bytes = built.encode("latin-1", errors="replace")
+
     if response.has_real_body:
-        return built.encode("latin-1") + response.body
+        return head_bytes + response.body
     else:
-        return built.encode("latin-1"), response.body
+        return head_bytes, response.body
 
 def framing(head: bytes) -> tuple[str, int]:
-    content_length = 0
+    cl_values: set[int] = set()
     chunked = False
+    te_seen = False
 
     for line in head.split(b"\r\n")[1:]:
         name, sep, value = line.partition(b":")
@@ -66,20 +69,35 @@ def framing(head: bytes) -> tuple[str, int]:
 
         if name == b"content-length":
             try:
-                cl = int(value)
-                if cl < 0:
-                    raise ParseError("negative content-length", 400)
-                content_length = cl
+                for part in value.split(b","):
+                    part = part.strip()
+                    if not part:
+                        raise ParseError("invalid content-length", 400)
+                    cl = int(part)
+                    if cl < 0:
+                        raise ParseError("negative content-length", 400)
+                    cl_values.add(cl)
             except ValueError:
                 raise ParseError("invalid content-length", 400)
 
-        elif name == b"transfer-encoding" and b"chunked" in value:
-            chunked = True
+        elif name == b"transfer-encoding":
+            te_seen = True
+            codings = [c.strip() for c in value.split(b",") if c.strip()]
+            if b"chunked" in codings:
+                if codings[-1] != b"chunked":
+                    raise ParseError("chunked must be the final transfer-encoding", 400)
+                chunked = True
+
+    if te_seen and cl_values:
+        raise ParseError("conflicting content-length and transfer-encoding", 400)
+
+    if len(cl_values) > 1:
+        raise ParseError("conflicting content-length values", 400)
 
     if chunked:
         return "chunked", 0
 
-    return "length", content_length
+    return "length", (next(iter(cl_values)) if cl_values else 0)
 
 async def read_chunked(reader: asyncio.StreamReader, limit: int) -> bytes:
     body = bytearray()
@@ -95,7 +113,14 @@ async def read_chunked(reader: asyncio.StreamReader, limit: int) -> bytes:
             raise ParseError("negative chunk size", 400)
 
         if size == 0:
-            await reader.readuntil(b"\r\n")
+            trailer_total = 0
+            while True:
+                line = await reader.readuntil(b"\r\n")
+                if line == b"\r\n":
+                    break
+                trailer_total += len(line)
+                if trailer_total > limit:
+                    raise ParseError("trailers too large", 431)
             break
 
         if len(body) + size > limit:
@@ -166,10 +191,7 @@ async def serve_connection(reader: asyncio.StreamReader, writer: asyncio.StreamW
                 break
             except asyncio.LimitOverrunError:
                 try:
-                    response = Response(b"Request Header Too Large", status_code=431, compression=False, protocol="HTTP/1.1")
-                    response.headers.set("Server", "Momiji", override=False)
-                    response.headers.set("Content-Length", str(len(response.body)))
-                    response.headers.set("Connection", "close")
+                    response = error_response(b"Request Header Too Large", status_code=431, protocol="HTTP/1.1", headers={"Connection": "close"})
                     await write(writer, serialize_response(response))
                 except (ConnectionError, OSError):
                     pass
@@ -177,10 +199,7 @@ async def serve_connection(reader: asyncio.StreamReader, writer: asyncio.StreamW
 
             if len(head) > config.request_max_header_size:
                 try:
-                    response = Response(b"Request Header Too Large", status_code=431, compression=False, protocol="HTTP/1.1")
-                    response.headers.set("Server", "Momiji", override=False)
-                    response.headers.set("Content-Length", str(len(response.body)))
-                    response.headers.set("Connection", "close")
+                    response = error_response(b"Request Header Too Large", status_code=431, protocol="HTTP/1.1", headers={"Connection": "close"})
                     await write(writer, serialize_response(response))
                 except (ConnectionError, OSError):
                     pass
@@ -209,10 +228,7 @@ async def serve_connection(reader: asyncio.StreamReader, writer: asyncio.StreamW
                     phrase = HTTPStatus(status).phrase
                 except ValueError:
                     phrase = "Bad Request"
-                response = Response(phrase.encode(), status_code=status, compression=False, protocol="HTTP/1.1")
-                response.headers.set("Server", "Momiji", override=False)
-                response.headers.set("Content-Length", str(len(response.body)))
-                response.headers.set("Connection", "close")
+                response = error_response(phrase.encode(), status_code=status, protocol="HTTP/1.1", headers={"Connection": "close"})
                 try:
                     await write(writer, serialize_response(response))
                 except (ConnectionError, OSError):
@@ -228,9 +244,8 @@ async def serve_connection(reader: asyncio.StreamReader, writer: asyncio.StreamW
             try:
                 response = await process(app, request)
             except Exception:
-                response = Response(b"Internal Server Error", status_code=500, compression=False, protocol="HTTP/1.1")
-                response.headers.set("Server", "Momiji", override=False)
-                response.headers.set("Content-Length", str(len(response.body)))
+                response = error_response(b"Internal Server Error", status_code=500, protocol="HTTP/1.1")
+                keep_alive = False
 
             response.protocol = "HTTP/1.1"
             response.headers.set("Connection", "keep-alive" if keep_alive else "close", override=False)

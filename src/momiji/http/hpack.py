@@ -133,13 +133,19 @@ def encode_string(value: bytes, huffman_encode: bool = True) -> bytearray:
     return out
 
 def decode_string(data: bytes, pos: int) -> tuple[bytes, int]:
+    if pos >= len(data):
+        raise HPACKError("truncated string literal header")
     is_huffman = bool(data[pos] & 0x80)
     length, pos = decode_integer(data, pos, 7)
     raw = data[pos:pos + length]
     if len(raw) != length:
         raise HPACKError("truncated string literal")
     pos += length
-    return (huffman.decode(raw) if is_huffman else bytes(raw)), pos
+    try:
+        decoded = huffman.decode(raw) if is_huffman else bytes(raw)
+    except (ValueError, KeyError) as exc:
+        raise HPACKError(f"invalid huffman sequence: {exc}")
+    return decoded, pos
 
 class DynamicTable:
     def __init__(self, max_size: int = 4096):

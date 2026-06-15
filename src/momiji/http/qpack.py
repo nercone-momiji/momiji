@@ -17,13 +17,19 @@ class QPACKError(Exception):
     pass
 
 def decode_string(data: bytes, pos: int, prefix_bits: int) -> tuple[bytes, int]:
+    if pos >= len(data):
+        raise QPACKError("truncated string header")
     is_huffman = bool(data[pos] & (1 << prefix_bits))
     length, pos = decode_integer(data, pos, prefix_bits)
     raw = data[pos:pos + length]
     if len(raw) != length:
         raise QPACKError("truncated string")
     pos += length
-    return (huffman.decode(raw) if is_huffman else bytes(raw)), pos
+    try:
+        decoded = huffman.decode(raw) if is_huffman else bytes(raw)
+    except (ValueError, KeyError) as exc:
+        raise QPACKError(f"invalid huffman sequence: {exc}")
+    return decoded, pos
 
 def encode_string(value: bytes, prefix_bits: int, flags: int = 0) -> bytearray:
     encoded = huffman.encode(value)

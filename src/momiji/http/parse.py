@@ -43,6 +43,14 @@ async def parse(data: bytes, *, protocol: Literal["HTTP/1.1", "HTTP/2.0", "HTTP/
         return parse_h1(data, protocol=protocol, client=client, scheme=scheme, secure=secure, tls=tls, quic=quic)
     return parse_fields(data, fields, protocol=protocol, client=client, scheme=scheme, secure=secure, tls=tls, quic=quic)
 
+def validate_target(target: str) -> None:
+    if not target:
+        raise ParseError("empty request target")
+    for ch in target:
+        code = ord(ch)
+        if code < 0x21 or code == 0x7F:
+            raise ParseError("invalid character in request target")
+
 def parse_h1(data, *, protocol, client, scheme, secure, tls, quic) -> Request:
     head, _, body = data.partition(b"\r\n\r\n")
     lines = head.split(b"\r\n")
@@ -57,6 +65,7 @@ def parse_h1(data, *, protocol, client, scheme, secure, tls, quic) -> Request:
         raise ParseError("unsupported method", 501)
     if version not in ("HTTP/1.0", "HTTP/1.1"):
         raise ParseError("unsupported http version", 505)
+    validate_target(target)
 
     headers = Headers({})
     for line in lines[1:]:
@@ -141,8 +150,12 @@ def parse_fields(body, fields, *, protocol, client, scheme, secure, tls, quic) -
             raise ParseError("missing :scheme")
         if target == "":
             raise ParseError("empty :path")
+        validate_target(target)
 
     if authority is not None:
+        existing_host = headers.get("host")
+        if existing_host is not None and existing_host != authority:
+            raise ParseError(":authority and host header disagree")
         headers.set("host", authority, override=True)
 
     transport_scheme: Literal["http", "https"] = "https" if scheme == "https" else "http"

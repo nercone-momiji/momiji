@@ -12,10 +12,10 @@ import rjsmin
 import rcssmin
 from scour import scour
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from async_lru import alru_cache
 
-from .models import Request, Response
+from .models import Request, Response, Headers
 
 if TYPE_CHECKING:
     from ..app import App
@@ -76,28 +76,41 @@ async def compress(response: Response, accepted_encodings: dict[str, float]) -> 
     if not (response.has_real_body and response.compression and accepted_encodings):
         return None
 
+    if response.headers.get("Content-Encoding"):
+        return None
+
     star_q = accepted_encodings.get("*", None)
 
-    candidates: list[tuple[str, callable]] = [
-        ("zstd", compress_zstd),
-        ("br", compress_brotli),
-        ("gzip", compress_gzip),
-        ("deflate", compress_deflate)
+    candidates: list[tuple[str, callable, int]] = [
+        ("zstd", compress_zstd, 0),
+        ("br", compress_brotli, 1),
+        ("gzip", compress_gzip, 2),
+        ("deflate", compress_deflate, 3)
     ]
 
-    for encoding, fn in candidates:
+    scored: list[tuple[float, int, str, callable]] = []
+    for encoding, fn, priority in candidates:
         q = accepted_encodings.get(encoding)
         if q is None:
             q = star_q
         if q is None or q <= 0:
             continue
+        scored.append((-q, priority, encoding, fn))
 
+    scored.sort()
+
+    for _, _, encoding, fn in scored:
         try:
             compressed = await fn(response.body)
         except Exception:
             continue
 
         response.headers.set("Content-Encoding", encoding)
+        existing_vary = response.headers.get("Vary", "")
+        vary_tokens = [v.strip() for v in existing_vary.split(",") if v.strip()]
+        if not any(v.lower() == "accept-encoding" for v in vary_tokens):
+            vary_tokens.append("Accept-Encoding")
+        response.headers.set("Vary", ", ".join(vary_tokens))
         return compressed
 
     return None
@@ -127,15 +140,16 @@ def parse_accept_encoding(value: str) -> dict[str, float]:
 
     return result
 
-async def process(app: App, request: Request) -> Response:
-    try:
-        result = app(request)
-        if inspect.isawaitable(result):
-            result = await result
-        response = result
-        response.protocol = response.protocol or request.protocol
-    except Exception:
-        response = Response(b"Internal Server Error", status_code=500, compression=False, minification=False, protocol=request.protocol)
+async def process(app: App | None, request: Request, response: Response | None = None) -> Response:
+    if response is None:
+        try:
+            result = app(request)
+            if inspect.isawaitable(result):
+                result = await result
+            response = result
+            response.protocol = response.protocol or request.protocol
+        except Exception:
+            response = Response(b"Internal Server Error", status_code=500, compression=False, minification=False, protocol=request.protocol)
 
     response.headers.set("Server", "Momiji", override=False)
 
@@ -158,3 +172,6 @@ async def process(app: App, request: Request) -> Response:
             pass
 
     return response
+
+async def error_response(body: bytes, status_code: int, protocol: Literal["HTTP/1.1", "HTTP/2.0", "HTTP/3.0"], headers: dict[str, str] = {}) -> Response:
+    return process(app=None, response=Response(body, status_code=status_code, compression=False, minification=False, protocol=protocol, headers=Headers(headers)))

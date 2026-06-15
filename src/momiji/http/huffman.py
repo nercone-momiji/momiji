@@ -45,7 +45,10 @@ def decode(data: bytes) -> bytes:
     for byte in data:
         for shift in range(7, -1, -1):
             bit = (byte >> shift) & 1
-            node = node[bit]
+            next_node = node.get(bit) if isinstance(node, dict) else None
+            if next_node is None:
+                raise ValueError("invalid Huffman code")
+            node = next_node
             if isinstance(node, int):
                 if node == EOS:
                     raise ValueError("EOS symbol encountered in Huffman sequence")
