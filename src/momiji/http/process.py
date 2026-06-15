@@ -333,4 +333,9 @@ async def process(app: App | None, request: Request, response: Response | None =
     if response.headers.get("Content-Type", "").startswith("text/") and "charset=" not in response.headers.get("Content-Type", ""):
         response.headers.set("Content-Type", response.headers.get("Content-Type", "") + "; charset=utf-8")
 
+    if request.method == "HEAD":
+        if response.is_streaming:
+            response.headers.remove("Transfer-Encoding")
+        response.body = None
+
     return response

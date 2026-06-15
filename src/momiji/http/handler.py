@@ -64,7 +64,7 @@ class H3WebSocketTransport:
         self.protocol.transmit()
 
     def close(self) -> None:
-        self.h3.ws_send(self.stream_id)
+        self.h3.ws_close(self.stream_id)
         self.protocol.transmit()
 
 class TCPProtocol(asyncio.Protocol):
@@ -80,6 +80,19 @@ class TCPProtocol(asyncio.Protocol):
         self.keep_alive: bool = True
         self.ws: WebSocket | None = None
         self.ws_buffer: bytearray = bytearray()
+        self.keepalive_handle: asyncio.TimerHandle | None = None
+
+    def reset_keepalive(self) -> None:
+        if self.keepalive_handle is not None:
+            self.keepalive_handle.cancel()
+            self.keepalive_handle = None
+        if self.transport is not None and self.keep_alive and self.ws is None:
+            self.keepalive_handle = asyncio.get_running_loop().call_later(self.handler.config.keepalive_timeout, self.on_keepalive_timeout)
+
+    def on_keepalive_timeout(self) -> None:
+        self.keepalive_handle = None
+        if self.transport is not None and not self.transport.is_closing():
+            self.transport.close()
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = transport
@@ -104,9 +117,13 @@ class TCPProtocol(asyncio.Protocol):
             self.secure = self.handler.listener.kind == "https"
             self.scheme = "https" if self.secure else "http"
 
+        self.reset_keepalive()
+
     def data_received(self, data: bytes) -> None:
         if self.transport is None:
             return
+
+        self.reset_keepalive()
 
         if self.ws is not None:
             self.ws_buffer.extend(data)
@@ -426,6 +443,10 @@ class TCPProtocol(asyncio.Protocol):
                 self.transport.write(out)
 
     def connection_lost(self, exc: BaseException | None) -> None:
+        if self.keepalive_handle is not None:
+            self.keepalive_handle.cancel()
+            self.keepalive_handle = None
+
         self.transport = None
 
         if self.h2 is not None:

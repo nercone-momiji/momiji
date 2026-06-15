@@ -134,6 +134,11 @@ class WebSocket:
             self.transport.close()
         self.queue.put_nowait(None)
 
+    async def ping(self, payload: bytes = b"") -> None:
+        if self.closed:
+            return
+        self.transport.write(build_frame(Opcode.PING, payload))
+
     async def receive(self) -> bytes | None:
         return await self.queue.get()
 
