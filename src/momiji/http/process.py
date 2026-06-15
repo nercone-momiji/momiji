@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import gzip
 import zlib
+import asyncio
 import inspect
 import mimetypes
 import zstandard
@@ -13,6 +14,7 @@ import rjsmin
 import rcssmin
 from scour import scour
 
+from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 from async_lru import alru_cache
 
@@ -57,6 +59,46 @@ async def compress_gzip(body: bytes) -> bytes:
 async def compress_deflate(body: bytes) -> bytes:
     return zlib.compress(body, level=6)
 
+async def compress_stream_zstd(body: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    compressor = zstandard.ZstdCompressor(level=3).compressobj()
+    async for chunk in body:
+        out = compressor.compress(chunk)
+        if out:
+            yield out
+    out = compressor.flush(zstandard.COMPRESSOBJ_FLUSH_FINISH)
+    if out:
+        yield out
+
+async def compress_stream_brotli(body: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    compressor = brotlicffi.Compressor(quality=4)
+    async for chunk in body:
+        out = compressor.process(chunk)
+        if out:
+            yield out
+    out = compressor.finish()
+    if out:
+        yield out
+
+async def compress_stream_gzip(body: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    compressor = zlib.compressobj(level=6, wbits=31)
+    async for chunk in body:
+        out = compressor.compress(chunk)
+        if out:
+            yield out
+    out = compressor.flush(zlib.Z_FINISH)
+    if out:
+        yield out
+
+async def compress_stream_deflate(body: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+    compressor = zlib.compressobj(level=6)
+    async for chunk in body:
+        out = compressor.compress(chunk)
+        if out:
+            yield out
+    out = compressor.flush(zlib.Z_FINISH)
+    if out:
+        yield out
+
 async def minimize(response: Response) -> bytes | None:
     if response.has_real_body and response.minification:
         content_type = response.headers.get("Content-Type", "")
@@ -73,33 +115,50 @@ async def minimize(response: Response) -> bytes | None:
             return None
     return None
 
-async def compress(response: Response, accepted_encodings: dict[str, float]) -> bytes | None:
-    if not (response.has_real_body and response.compression and accepted_encodings):
+async def compress(response: Response, accepted_encodings: dict[str, float]) -> bytes | AsyncIterator[bytes] | None:
+    if not (response.body is not None and response.compression and accepted_encodings):
         return None
 
-    candidates: list[tuple[str, callable, int]] = [
-        ("zstd", compress_zstd, 0),
-        ("br", compress_brotli, 1),
-        ("gzip", compress_gzip, 2),
-        ("deflate", compress_deflate, 3)
+    candidates: list[tuple[str, object, object, int]] = [
+        ("zstd",    compress_zstd,    compress_stream_zstd,    0),
+        ("br",      compress_brotli,  compress_stream_brotli,  1),
+        ("gzip",    compress_gzip,    compress_stream_gzip,    2),
+        ("deflate", compress_deflate, compress_stream_deflate, 3),
     ]
 
     star_q = accepted_encodings.get("*", None)
 
-    scored: list[tuple[float, int, str, callable]] = []
-    for encoding, fn, priority in candidates:
+    scored: list[tuple[float, int, str, object, object]] = []
+    for encoding, fn, stream_fn, priority in candidates:
         q = accepted_encodings.get(encoding)
         if q is None:
             q = star_q
         if q is None or q <= 0:
             continue
-        scored.append((-q, priority, encoding, fn))
+        scored.append((-q, priority, encoding, fn, stream_fn))
 
     scored.sort()
 
-    for _, _, encoding, fn in scored:
+    for _, _, encoding, fn, stream_fn in scored:
+        if response.is_streaming:
+            response.headers.set("Content-Encoding", encoding)
+            response.headers.append_vary("Accept-Encoding")
+            return stream_fn(response.body)
+
+        if response.has_real_body:
+            try:
+                compressed = await fn(response.body)
+            except Exception:
+                continue
+            response.headers.set("Content-Encoding", encoding)
+            response.headers.append_vary("Accept-Encoding")
+            return compressed
+
+        loop = asyncio.get_running_loop()
         try:
-            compressed = await fn(response.body)
+            path_str = os.fspath(response.body)
+            data = await loop.run_in_executor(None, lambda: open(path_str, "rb").read())
+            compressed = await fn(data)
         except Exception:
             continue
 
@@ -203,14 +262,16 @@ async def process(app: App | None, request: Request, response: Response | None =
             response.body = response.body[start:end + 1]
             response.status_code = 206
             response.headers.set("Content-Range", f"bytes {start}-{end}/{total}")
-            response.compression = False
 
-        response.body = await compress(response, parse_accept_encoding(request.headers.get("Accept-Encoding", ""))) or response.body
+        if response.status_code != 206:
+            response.body = await compress(response, parse_accept_encoding(request.headers.get("Accept-Encoding", ""))) or response.body
 
         response.headers.set("Content-Type", response.content_type or response.headers.get("Content-Type") or "application/octet-stream")
         response.headers.set("Content-Length", str(len(response.body)))
 
     elif response.is_streaming:
+        response.body = await compress(response, parse_accept_encoding(request.headers.get("Accept-Encoding", ""))) or response.body
+
         response.headers.set("Content-Type", response.content_type or response.headers.get("Content-Type") or "application/octet-stream")
         response.headers.remove("Content-Length")
 
@@ -237,6 +298,7 @@ async def process(app: App | None, request: Request, response: Response | None =
                 response.body = None
                 response.headers.set("Content-Length", "0")
                 return response
+
             start, end = parsed
             response.file_range = (start, end)
             response.status_code = 206
@@ -244,7 +306,13 @@ async def process(app: App | None, request: Request, response: Response | None =
             response.headers.set("Content-Length", str(end - start + 1))
 
         else:
-            response.headers.set("Content-Length", str(total))
+            compressed = await compress(response, parse_accept_encoding(request.headers.get("Accept-Encoding", "")))
+            if compressed is not None:
+                response.body = compressed
+                response.headers.remove("Accept-Ranges")
+                response.headers.set("Content-Length", str(len(compressed)))
+            else:
+                response.headers.set("Content-Length", str(total))
 
     if response.headers.get("Content-Type", "").startswith("text/") and "charset=" not in response.headers.get("Content-Type", ""):
         response.headers.set("Content-Type", response.headers.get("Content-Type", "") + "; charset=utf-8")

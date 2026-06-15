@@ -344,12 +344,18 @@ class TLS:
             libssl = ctypes.CDLL('libssl.so.3')
             libssl.SSL_CTX_set1_groups_list.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             libssl.SSL_CTX_set1_groups_list.restype = ctypes.c_int
+
             ptr_size = ctypes.sizeof(ctypes.c_void_p)
             ssl_ctx_ptr = ctypes.c_void_p.from_address(id(ctx) + 2 * ptr_size).value
-            if ssl_ctx_ptr:
-                libssl.SSL_CTX_set1_groups_list(ssl_ctx_ptr, ":".join([group.value for group in groups]).encode('ascii'))
+            if ssl_ctx_ptr is None:
+                raise RuntimeError("Failed to obtain SSL_CTX pointer for group configuration")
+
+            result = libssl.SSL_CTX_set1_groups_list(ssl_ctx_ptr, ":".join([group.value for group in groups]).encode('ascii'))
+            if result != 1:
+                raise ValueError(f"SSL_CTX_set1_groups_list failed (return={result})")
+
         except Exception:
-            pass
+            raise RuntimeError("Failed to set groups with ctypes")
 
     @staticmethod
     def set_ssl_ciphers_tls12(ctx: ssl.SSLContext, ciphers: list[Cipher]):
@@ -361,12 +367,18 @@ class TLS:
             libssl = ctypes.CDLL('libssl.so.3')
             libssl.SSL_CTX_set_cipher_list.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             libssl.SSL_CTX_set_cipher_list.restype = ctypes.c_int
+
             ptr_size = ctypes.sizeof(ctypes.c_void_p)
             ssl_ctx_ptr = ctypes.c_void_p.from_address(id(ctx) + 2 * ptr_size).value
-            if ssl_ctx_ptr:
-                libssl.SSL_CTX_set_cipher_list(ssl_ctx_ptr, ":".join([cipher.value for cipher in ciphers]).encode('ascii'))
+            if ssl_ctx_ptr is None:
+                raise RuntimeError("Failed to obtain SSL_CTX pointer for cipher configuration")
+
+            result = libssl.SSL_CTX_set_cipher_list(ssl_ctx_ptr, ":".join([cipher.value for cipher in ciphers]).encode('ascii'))
+            if result != 1:
+                raise ValueError(f"SSL_CTX_set_cipher_list failed (return={result})")
+
         except Exception:
-            pass
+            raise RuntimeError("Failed to set TLS 1.2 ciphers with ctypes")
 
     @staticmethod
     def set_ssl_ciphers_tls13(ctx: ssl.SSLContext, ciphers: list[Cipher]):
@@ -378,12 +390,18 @@ class TLS:
             libssl = ctypes.CDLL('libssl.so.3')
             libssl.SSL_CTX_set_ciphersuites.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             libssl.SSL_CTX_set_ciphersuites.restype = ctypes.c_int
+
             ptr_size = ctypes.sizeof(ctypes.c_void_p)
             ssl_ctx_ptr = ctypes.c_void_p.from_address(id(ctx) + 2 * ptr_size).value
-            if ssl_ctx_ptr:
-                libssl.SSL_CTX_set_ciphersuites(ssl_ctx_ptr, ":".join([cipher.value for cipher in ciphers]).encode('ascii'))
+            if ssl_ctx_ptr is None:
+                raise RuntimeError("Failed to obtain SSL_CTX pointer for ciphersuite configuration")
+
+            result = libssl.SSL_CTX_set_ciphersuites(ssl_ctx_ptr, ":".join([cipher.value for cipher in ciphers]).encode('ascii'))
+            if result != 1:
+                raise ValueError(f"SSL_CTX_set_ciphersuites failed (return={result})")
+
         except Exception:
-            pass
+            raise RuntimeError("Failed to set TLS 1.3 ciphers with ctypes")
 
     @staticmethod
     def set_ssl_ciphers(ctx: ssl.SSLContext, ciphers: list[Cipher]):
