@@ -18,7 +18,7 @@ For example, a server that simply returns "Hello, World!" can be created in just
 from momiji import Server, App, Response
 
 class MyApp(App):
-    def __call__(self, request):
+    async def on_request(self, request):
         return Response("Hello, World!".encode(), content_type="text/plain")
 
 if __name__ == "__main__":
@@ -33,7 +33,7 @@ The structure like Server/App/Response is inspired by ASGI.
 ### It's too simple. What is this!
 Yes, it is very simple. Is there a problem with that?
 
-### I found a repository called Aki. It seems related to Momiji... what is it?
+### I found a repository called [Aki](https://github.com/nercone-momiji/aki/). It seems related to Momiji... what is it?
 Momiji is very simple, but it does not have smart features like FastAPI that "define endpoints and route automatically."
 
 Aki is a library planned for development that aims to make Momiji usable with the same feel as FastAPI.

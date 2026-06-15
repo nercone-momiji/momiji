@@ -247,7 +247,7 @@ async def process(app: App | None, request: Request, response: Response | None =
 
         if response is None:
             try:
-                result = app(request)
+                result = app.on_request(request)
                 if inspect.isawaitable(result):
                     result = await result
                 response = result
