@@ -6,7 +6,8 @@ import asyncio
 import ipaddress
 from typing import TYPE_CHECKING, Literal
 
-from aioquic.asyncio import QuicConnectionProtocol, serve as quic_serve
+from aioquic.asyncio import QuicConnectionProtocol
+from aioquic.asyncio.server import QuicServer as AioquicServer
 from aioquic.quic.configuration import QuicConfiguration
 
 from .h1 import H1
@@ -221,9 +222,7 @@ class Handler:
             if self.config.tls.certfile:
                 quic_config.load_cert_chain(self.config.tls.certfile, self.config.tls.keyfile)
 
-            sockname = self.listener.sock.getsockname()
-            host, port = sockname[0], sockname[1]
-            self.quic_server = await quic_serve(host=host, port=port, configuration=quic_config, create_protocol=lambda *a, **kw: H3Protocol(*a, handler=self, **kw))
+            _, self.quic_server = await loop.create_datagram_endpoint(lambda: AioquicServer(configuration=quic_config, create_protocol=lambda *a, **kw: H3Protocol(*a, handler=self, **kw)), sock=self.listener.sock)
 
         else:
             raise ValueError(f"unsupported listener kind: {kind!r}")

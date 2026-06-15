@@ -1,8 +1,7 @@
 from .http import Request, Response
-from .config import Config
 
 class App:
-    def __init__(self, config: Config):
+    def __init__(self):
         pass
 
     def __call__(self, request: Request) -> Response:

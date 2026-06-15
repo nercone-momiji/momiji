@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import signal
 import socket
+import uvloop
 import asyncio
 
 from .app import App
@@ -61,11 +62,58 @@ class Server:
         return listeners
 
     def run(self):
-        asyncio.run(self.serve())
-
-    async def serve(self):
+        workers = self.config.workers if self.config.workers > 0 else (os.cpu_count() or 1)
         listeners = self.listeners
-        handlers = [Handler(listener, self.app, self.config) for listener in listeners]
+
+        if workers == 1:
+            uvloop.run(self.serve(listeners))
+            return
+
+        if not hasattr(os, "fork"):
+            raise RuntimeError("multiprocessing requires a Unix platform (os.fork not available)")
+
+        pids: list[int] = []
+        alive: set[int] = set()
+
+        try:
+            for i in range(workers):
+                pid = os.fork()
+                if pid == 0:
+                    try:
+                        uvloop.run(self.serve(listeners))
+                    except KeyboardInterrupt:
+                        pass
+                    finally:
+                        os._exit(0)
+                pids.append(pid)
+                alive.add(pid)
+
+            def forward_signal(signum, frame):
+                for pid in list(alive):
+                    try:
+                        os.kill(pid, signum)
+                    except ProcessLookupError:
+                        pass
+
+            signal.signal(signal.SIGINT, forward_signal)
+            signal.signal(signal.SIGTERM, forward_signal)
+
+            while alive:
+                try:
+                    pid, _ = os.wait()
+                    alive.discard(pid)
+                except ChildProcessError:
+                    break
+
+        finally:
+            for pid in alive:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+
+    async def serve(self, listeners: list[Listener] | None = None):
+        handlers = [Handler(listener, self.app, self.config) for listener in (listeners if listeners is not None else self.listeners)]
 
         for handler in handlers:
             await handler.start()

@@ -7,7 +7,7 @@ class DemoApp(App):
 
 def main():
     print("Starting server... Try access it to http://localhost:80/")
-    server = Server(DemoApp)
+    server = Server(DemoApp())
     server.run()
 
 if __name__ == "__main__":
