@@ -13,9 +13,6 @@ class Server:
         self.app = app
         self.config = config or Config()
 
-    def bind_socket(self, host: str, port: int, type: Literal["http", "https", "quic", "unix"]) -> socket.socket:
-        ...
-
     def bind_unix(self, path: os.PathLike) -> socket.socket:
         if os.path.exists(path):
             os.unlink(path)
@@ -25,6 +22,9 @@ class Server:
         sock.setblocking(False)
         return sock
 
+    def bind_socket(self, host: str, port: int, type: socket.SocketKind) -> socket.socket:
+        ...
+
     def parse_host_port(self, value: str) -> tuple[str, int]:
         host, _, port = value.rpartition(":")
         return host.strip("[]"), int(port)
@@ -32,6 +32,9 @@ class Server:
     @property
     def listeners(self) -> list[Listener]:
         listeners: list[Listener] = []
+
+        for path in self.config.bind_unix:
+            listeners.append(Listener(self.bind_unix(path), "unix"))
 
         for value in self.config.bind_http:
             host, port = self.parse_host_port(value)
@@ -44,9 +47,6 @@ class Server:
         for value in self.config.bind_quic:
             host, port = self.parse_host_port(value)
             listeners.append(Listener(self.bind_socket(host, port, socket.SOCK_DGRAM), "quic"))
-
-        for path in self.config.bind_unix:
-            listeners.append(Listener(self.bind_unix(path), "unix"))
 
         return listeners
 
