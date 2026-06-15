@@ -11,6 +11,8 @@ authors = [ { name = "Nercone", email = "nercone@nercone.dev" } ]
 license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
+    "h2",
+    "aioquic",
     "uvloop",
     "async-lru",
     "minify-html",
@@ -25,6 +27,9 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent"
 ]
+
+[tool.uv.sources]
+aioquic = { git = "https://github.com/nercone-forks/aioquic", branch = "feature/pqc-support" }
 
 [tool.uv.build-backend]
 module-name = "momiji"

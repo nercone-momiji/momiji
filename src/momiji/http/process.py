@@ -161,7 +161,7 @@ async def process(app: App | None, request: Request, response: Response | None =
 
     elif response.body is not None:
         try:
-            response.headers.set("Content-Length", str(os.path.getsize(os.fspath(response.body))), override=False)
+            response.headers.set("Content-Length", str(os.path.getsize(os.fspath(response.body))))
         except OSError:
             pass
 

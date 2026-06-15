@@ -3,12 +3,14 @@ from __future__ import annotations
 import os
 import socket
 import ipaddress
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from dataclasses import dataclass, field
 
-from .h2 import H2Info
-from .h3 import H3Info
 from ..tls import TLSInfo
+
+if TYPE_CHECKING:
+    from .h2 import H2Info
+    from .h3 import H3Info
 
 @dataclass
 class Listener:

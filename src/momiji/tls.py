@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import ssl
 import ctypes
 from enum import Enum
