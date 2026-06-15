@@ -7,6 +7,9 @@ from .tls import TLSConfig
 class Config:
     workers: int = 0
 
+    auto_restart: bool = False
+    shutdown_timeout: float = 30.0
+
     keepalive_timeout: float = 75
 
     protocols: list[Literal["http/1.1", "h2", "h3"]] = field(default_factory=lambda: ["h3", "h2", "http/1.1"])

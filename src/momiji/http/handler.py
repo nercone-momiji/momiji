@@ -16,7 +16,7 @@ from .h2 import H2, H2WSUpgrade
 from .h3 import H3, H3WSUpgrade
 from .models import Listener, Request, Response
 from .process import process
-from .websocket import WebSocket, compute_accept, parse_frames
+from .websocket import WebSocket, PerMessageDeflate, compute_accept, parse_frames
 from ..tls import TLS, TLSInfo
 
 if TYPE_CHECKING:
@@ -32,6 +32,17 @@ def parse_peername(transport: asyncio.BaseTransport) -> tuple[ipaddress.IPv4Addr
         return (ipaddress.ip_address(host), int(port))
     except ValueError:
         return (ipaddress.IPv4Address("0.0.0.0"), int(port))
+
+def negotiate_websocket(request: Request, app: App) -> tuple[str | None, PerMessageDeflate | None]:
+    offered_raw = request.headers.get("Sec-WebSocket-Protocol") or ""
+    offered = [p.strip() for p in offered_raw.split(",") if p.strip()] if offered_raw else []
+    supported: list[str] = getattr(app, "websocket_subprotocols", [])
+    subprotocol: str | None = next((p for p in offered if p in supported), None)
+
+    ext_raw = request.headers.get("Sec-WebSocket-Extensions") or ""
+    deflate = PerMessageDeflate.from_client_offer(ext_raw) if ext_raw else None
+
+    return subprotocol, deflate
 
 class H2WebSocketTransport:
     def __init__(self, h2: H2, stream_id: int, tcp_transport: asyncio.Transport):
@@ -98,6 +109,13 @@ class TCPProtocol(asyncio.Protocol):
         self.transport = transport
         self.client = parse_peername(transport)
 
+        if self.handler.shutdown:
+            transport.close()
+            return
+
+        if isinstance(transport, asyncio.Transport):
+            self.handler.active_connections.add(transport)
+
         ssl_object: ssl.SSLObject | None = transport.get_extra_info("ssl_object")
         if ssl_object is not None:
             self.secure = True
@@ -141,10 +159,10 @@ class TCPProtocol(asyncio.Protocol):
                 self.transport.write(out)
 
             for request in requests:
-                asyncio.create_task(self.respond_h2(request))
+                self.handler.create_task(self.respond_h2(request))
 
             for ws_upgrade in ws_upgrades:
-                asyncio.create_task(self.respond_ws_h2(ws_upgrade))
+                self.handler.create_task(self.respond_ws_h2(ws_upgrade))
 
             if closed:
                 goaway = self.h2.close()
@@ -203,7 +221,7 @@ class TCPProtocol(asyncio.Protocol):
 
             connection_token = (request.headers.get("Connection") or "").lower()
             self.keep_alive = connection_token != "close"
-            asyncio.create_task(self.respond_h1(request))
+            self.handler.create_task(self.respond_h1(request))
 
             if not self.keep_alive:
                 return
@@ -219,10 +237,22 @@ class TCPProtocol(asyncio.Protocol):
         ws_version = (request.headers.get("Sec-WebSocket-Version", "")).strip()
 
         if upgrade == "websocket" and "upgrade" in connection and ws_key and ws_version == "13":
+            if self.handler.shutdown:
+                self.transport.write(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Connection: close\r\n"
+                    b"Content-Length: 0\r\n\r\n"
+                )
+                self.transport.close()
+                return
             await self.upgrade_websocket(request, ws_key)
             return
 
         response = await process(self.handler.app, request, middlewares=self.handler.middlewares)
+
+        if self.handler.shutdown:
+            response.headers.set("Connection", "close")
+            self.keep_alive = False
 
         if "h3" in self.handler.config.protocols and self.handler.config.bind_quic:
             _, _, h3_port = self.handler.config.bind_quic[0].rpartition(':')
@@ -267,20 +297,30 @@ class TCPProtocol(asyncio.Protocol):
     async def upgrade_websocket(self, request: Request, ws_key: str) -> None:
         if self.transport is None:
             return
+
+        subprotocol, deflate = negotiate_websocket(request, self.handler.app)
         accept = compute_accept(ws_key)
-        self.transport.write(
-            b"HTTP/1.1 101 Switching Protocols\r\n"
-            b"Upgrade: websocket\r\n"
-            b"Connection: Upgrade\r\n"
+
+        lines = [
+            b"HTTP/1.1 101 Switching Protocols\r\n",
+            b"Upgrade: websocket\r\n",
+            b"Connection: Upgrade\r\n",
             b"Sec-WebSocket-Accept: " + accept.encode() + b"\r\n"
-            b"\r\n"
-        )
-        ws = WebSocket(self.transport)
+        ]
+        if subprotocol:
+            lines.append(b"Sec-WebSocket-Protocol: " + subprotocol.encode() + b"\r\n")
+        if deflate is not None:
+            lines.append(b"Sec-WebSocket-Extensions: " + deflate.response_header().encode() + b"\r\n")
+        lines.append(b"\r\n")
+
+        self.transport.write(b"".join(lines))
+        ws = WebSocket(self.transport, subprotocol=subprotocol, deflate=deflate)
         self.ws = ws
         self.ws_buffer = bytearray()
-        asyncio.create_task(self.run_websocket(request, ws))
+        self.handler.create_task(self.run_websocket(request, ws))
 
     async def run_websocket(self, request: Request, ws: WebSocket) -> None:
+        self.handler.active_ws.add(ws)
         try:
             for middleware in self.handler.middlewares:
                 result = await middleware.on_websocket(request, ws)
@@ -291,6 +331,7 @@ class TCPProtocol(asyncio.Protocol):
         except Exception:
             pass
         finally:
+            self.handler.active_ws.discard(ws)
             if not ws.closed:
                 await ws.close(1011)
 
@@ -373,14 +414,16 @@ class TCPProtocol(asyncio.Protocol):
         if self.transport is None or self.h2 is None:
             return
 
-        out = self.h2.ws_accept(upgrade.stream_id)
+        subprotocol, deflate = negotiate_websocket(upgrade.request, self.handler.app)
+
+        out = self.h2.ws_accept(upgrade.stream_id, subprotocol=subprotocol, extensions=deflate.response_header() if deflate is not None else None)
         if out:
             self.transport.write(out)
 
         ws_transport = H2WebSocketTransport(self.h2, upgrade.stream_id, self.transport)
-        ws = WebSocket(ws_transport, require_masking=False)
+        ws = WebSocket(ws_transport, require_masking=False, subprotocol=subprotocol, deflate=deflate)
 
-        asyncio.create_task(self.read_ws_h2(upgrade.stream_id, ws))
+        self.handler.create_task(self.read_ws_h2(upgrade.stream_id, ws))
         await self.run_websocket(upgrade.request, ws)
 
     async def read_ws_h2(self, stream_id: int, ws: WebSocket) -> None:
@@ -447,7 +490,11 @@ class TCPProtocol(asyncio.Protocol):
             self.keepalive_handle.cancel()
             self.keepalive_handle = None
 
+        transport = self.transport
         self.transport = None
+
+        if transport is not None:
+            self.handler.active_connections.discard(transport)
 
         if self.h2 is not None:
             for queue in self.h2.ws_streams.values():
@@ -464,24 +511,24 @@ class H3Protocol(QuicConnectionProtocol):
         super().__init__(*args, **kwargs)
         self.handler = handler
         self.h3: H3 | None = None
-        self._client: tuple = (ipaddress.IPv4Address("0.0.0.0"), 0)
-        self._tls: TLSInfo | None = None
+        self.client: tuple = (ipaddress.IPv4Address("0.0.0.0"), 0)
+        self.tls: TLSInfo | None = None
 
     def quic_event_received(self, event) -> None:
-        if isinstance(event, HandshakeCompleted) and self._tls is None:
-            self._tls = TLS.extract_tls_info_h3(self._quic)
+        if isinstance(event, HandshakeCompleted) and self.tls is None:
+            self.tls = TLS.extract_tls_info_h3(self._quic)
 
         if self.h3 is None:
             self.h3 = H3(self._quic, connection_id=self._quic.host_cid)
-            self._client = parse_peername(self._transport)
+            self.client = parse_peername(self._transport)
 
-        requests, ws_upgrades = self.h3.handle_event(event, client=self._client, scheme="https", secure=True, tls=self._tls)
+        requests, ws_upgrades = self.h3.handle_event(event, client=self.client, scheme="https", secure=True, tls=self.tls)
 
         for request in requests:
-            asyncio.create_task(self.respond(request))
+            self.handler.create_task(self.respond(request))
 
         for ws_upgrade in ws_upgrades:
-            asyncio.create_task(self.ws_response_h3(ws_upgrade))
+            self.handler.create_task(self.ws_response_h3(ws_upgrade))
 
     async def respond(self, request: Request) -> None:
         if self.h3 is None or request.h3 is None:
@@ -523,15 +570,18 @@ class H3Protocol(QuicConnectionProtocol):
         if self.h3 is None:
             return
 
-        self.h3.ws_accept(upgrade.stream_id)
+        subprotocol, deflate = negotiate_websocket(upgrade.request, self.handler.app)
+
+        self.h3.ws_accept(upgrade.stream_id, subprotocol=subprotocol, extensions=deflate.response_header() if deflate is not None else None)
         self.transmit()
 
         ws_transport = H3WebSocketTransport(self.h3, upgrade.stream_id, self)
-        ws = WebSocket(ws_transport, require_masking=False)
+        ws = WebSocket(ws_transport, require_masking=False, subprotocol=subprotocol, deflate=deflate)
 
-        asyncio.create_task(self.ws_read_h3(upgrade.stream_id, ws))
+        self.handler.create_task(self.ws_read_h3(upgrade.stream_id, ws))
 
         request = upgrade.request
+        self.handler.active_ws.add(ws)
         try:
             for middleware in self.handler.middlewares:
                 result = await middleware.on_websocket(request, ws)
@@ -544,6 +594,7 @@ class H3Protocol(QuicConnectionProtocol):
             pass
 
         finally:
+            self.handler.active_ws.discard(ws)
             if not ws.closed:
                 await ws.close(1011)
 
@@ -612,6 +663,41 @@ class Handler:
         self.config = config
         self.tcp_server: asyncio.base_events.Server | None = None
         self.quic_server = None
+        self.shutdown = False
+        self.active_tasks: set[asyncio.Task] = set()
+        self.active_ws: set[WebSocket] = set()
+        self.active_connections: set[asyncio.Transport] = set()
+
+    def create_task(self, coro) -> asyncio.Task:
+        task = asyncio.create_task(coro)
+        self.active_tasks.add(task)
+        task.add_done_callback(self.active_tasks.discard)
+        return task
+
+    async def drain(self, timeout: float) -> None:
+        self.shutdown = True
+
+        if self.tcp_server is not None:
+            self.tcp_server.close()
+
+        for ws in list(self.active_ws):
+            if not ws.closed:
+                try:
+                    await ws.close(1001, "Server shutdown")
+                except Exception:
+                    pass
+
+        tasks = list(self.active_tasks)
+        if tasks:
+            _, pending = await asyncio.wait(tasks, timeout=timeout)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        for transport in list(self.active_connections):
+            if not transport.is_closing():
+                transport.close()
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
@@ -637,7 +723,10 @@ class Handler:
     async def stop(self) -> None:
         if self.tcp_server is not None:
             self.tcp_server.close()
-            await self.tcp_server.wait_closed()
+            try:
+                await self.tcp_server.wait_closed()
+            except Exception:
+                pass
             self.tcp_server = None
         if self.quic_server is not None:
             self.quic_server.close()

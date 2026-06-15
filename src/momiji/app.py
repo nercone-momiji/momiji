@@ -2,6 +2,8 @@ from typing import Awaitable
 from .http import Request, Response, WebSocket
 
 class App:
+    websocket_subprotocols: list[str] = []
+
     def __init__(self):
         pass
 

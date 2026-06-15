@@ -148,8 +148,13 @@ class H3:
     def send_chunk(self, stream_id: int, chunk: bytes, end_stream: bool) -> None:
         self.connection.send_data(stream_id, chunk, end_stream=end_stream)
 
-    def ws_accept(self, stream_id: int) -> None:
-        self.connection.send_headers(stream_id, [(b":status", b"200")], end_stream=False)
+    def ws_accept(self, stream_id: int, subprotocol: str | None = None, extensions: str | None = None) -> None:
+        headers: list[tuple[bytes, bytes]] = [(b":status", b"200")]
+        if subprotocol:
+            headers.append((b"sec-websocket-protocol", subprotocol.encode()))
+        if extensions:
+            headers.append((b"sec-websocket-extensions", extensions.encode()))
+        self.connection.send_headers(stream_id, headers, end_stream=False)
 
     def ws_send(self, stream_id: int, data: bytes) -> None:
         self.connection.send_data(stream_id, data, end_stream=False)

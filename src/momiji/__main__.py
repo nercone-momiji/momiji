@@ -2,7 +2,7 @@ from .app import App, Response
 from .server import Server
 
 class DemoApp(App):
-    def __call__(self, request):
+    async def on_request(self, request):
         return Response("It works! This is Response from Demo.".encode(), content_type="text/plain")
 
 def main():

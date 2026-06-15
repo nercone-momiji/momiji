@@ -179,8 +179,13 @@ class H2:
             self.connection.end_stream(stream_id)
         return self.connection.data_to_send()
 
-    def ws_accept(self, stream_id: int) -> bytes:
-        self.connection.send_headers(stream_id, [(":status", "200")], end_stream=False)
+    def ws_accept(self, stream_id: int, subprotocol: str | None = None, extensions: str | None = None) -> bytes:
+        headers = [(":status", "200")]
+        if subprotocol:
+            headers.append(("sec-websocket-protocol", subprotocol))
+        if extensions:
+            headers.append(("sec-websocket-extensions", extensions))
+        self.connection.send_headers(stream_id, headers, end_stream=False)
         return self.connection.data_to_send()
 
     def ws_send(self, stream_id: int, data: bytes) -> bytes:

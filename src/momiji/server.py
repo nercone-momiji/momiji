@@ -79,36 +79,45 @@ class Server:
         if not hasattr(os, "fork"):
             raise RuntimeError("multiprocessing requires a Unix platform (os.fork not available)")
 
-        pids: list[int] = []
         alive: set[int] = set()
+        shutting_down = False
+
+        def spawn_worker() -> int:
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    uvloop.run(self.serve(listeners))
+                except KeyboardInterrupt:
+                    pass
+                finally:
+                    os._exit(0)
+            alive.add(pid)
+            return pid
+
+        for _ in range(workers):
+            spawn_worker()
+
+        def forward_signal(signum, frame):
+            nonlocal shutting_down
+            shutting_down = True
+            for pid in list(alive):
+                try:
+                    os.kill(pid, signum)
+                except ProcessLookupError:
+                    pass
+
+        signal.signal(signal.SIGINT, forward_signal)
+        signal.signal(signal.SIGTERM, forward_signal)
 
         try:
-            for i in range(workers):
-                pid = os.fork()
-                if pid == 0:
-                    try:
-                        uvloop.run(self.serve(listeners))
-                    except KeyboardInterrupt:
-                        pass
-                    finally:
-                        os._exit(0)
-                pids.append(pid)
-                alive.add(pid)
-
-            def forward_signal(signum, frame):
-                for pid in list(alive):
-                    try:
-                        os.kill(pid, signum)
-                    except ProcessLookupError:
-                        pass
-
-            signal.signal(signal.SIGINT, forward_signal)
-            signal.signal(signal.SIGTERM, forward_signal)
-
             while alive:
                 try:
                     pid, _ = os.wait()
                     alive.discard(pid)
+
+                    if not shutting_down and self.config.auto_restart:
+                        spawn_worker()
+
                 except ChildProcessError:
                     break
 
@@ -141,6 +150,8 @@ class Server:
         finally:
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.remove_signal_handler(sig)
+
+            await asyncio.gather(*[handler.drain(self.config.shutdown_timeout) for handler in handlers], return_exceptions=True)
 
             await self.app.on_stop()
 

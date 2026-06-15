@@ -273,7 +273,11 @@ class TLSInfo:
 class TLSConfig:
     certfile: str | None = None
     keyfile: str | None = None
+    cafile: str | None = None
+
+    verify_mode: ssl.VerifyMode = ssl.CERT_REQUIRED
     minimum_version: ssl.TLSVersion = ssl.TLSVersion.TLSv1_2
+
     ciphers: list[Cipher] = field(default_factory=lambda: [
         # TLS 1.3
         Cipher.TLS_AES_128_GCM_SHA256,
@@ -428,6 +432,10 @@ class TLS:
 
         if config.tls.certfile and config.tls.keyfile:
             ctx.load_cert_chain(config.tls.certfile, config.tls.keyfile)
+
+        if config.tls.cafile:
+            ctx.verify_mode = config.tls.verify_mode
+            ctx.load_verify_locations(cafile=config.tls.cafile)
 
         TLS.set_ssl_groups(ctx, config.tls.groups)
         TLS.set_ssl_ciphers(ctx, config.tls.ciphers)
