@@ -74,7 +74,7 @@ async def minimize(response: Response) -> bytes | None:
     return None
 
 async def compress(response: Response, accepted_encodings: dict[str, float]) -> bytes | None:
-    if not (response.has_real_body and response.compression and len(accepted_encodings) > 0):
+    if not (response.has_real_body and response.compression and accepted_encodings):
         return None
 
     candidates: list[tuple[str, callable, int]] = [
@@ -142,7 +142,6 @@ async def process(app: App | None, request: Request, response: Response | None =
             if inspect.isawaitable(result):
                 result = await result
             response = result
-            response.protocol = response.protocol or request.protocol
         except Exception:
             response = Response(b"Internal Server Error", status_code=500, compression=False, minification=False, protocol=request.protocol)
 

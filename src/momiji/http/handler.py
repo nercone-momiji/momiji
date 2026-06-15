@@ -144,13 +144,20 @@ class TCPProtocol(asyncio.Protocol):
             return
 
         response = await process(self.handler.app, request)
+
+        if "h3" in self.handler.config.protocols and self.handler.config.bind_quic:
+            _, _, h3_port = self.handler.config.bind_quic[0].rpartition(':')
+            response.headers.set("Alt-Svc", f"h3=\":{int(h3_port)}\"", override=False)
+
         result = H1.build(response)
 
         if isinstance(result, tuple):
-            head, body_path = result
+            head, alt_body = result
             self.transport.write(head)
-            if body_path is not None:
-                await self.send_file_h1(body_path)
+
+            if alt_body is not None:
+                await self.send_file_h1(alt_body)
+
         else:
             self.transport.write(result)
 
@@ -178,12 +185,20 @@ class TCPProtocol(asyncio.Protocol):
     async def respond_h2(self, request: Request) -> None:
         if self.transport is None or self.h2 is None or request.h2 is None:
             return
+
         response = await process(self.handler.app, request)
-        out, file_path = self.h2.send(request.h2.stream_id, response)
+
+        if "h3" in self.handler.config.protocols and self.handler.config.bind_quic:
+            _, _, h3_port = self.handler.config.bind_quic[0].rpartition(':')
+            response.headers.set("Alt-Svc", f"h3=\":{int(h3_port)}\"", override=False)
+
+        out, alt_body = self.h2.send(request.h2.stream_id, response)
+
         if out:
             self.transport.write(out)
-        if file_path is not None:
-            await self.send_file_h2(request.h2.stream_id, file_path)
+
+        if alt_body is not None:
+            await self.send_file_h2(request.h2.stream_id, alt_body)
 
     async def send_file_h2(self, stream_id: int, path: os.PathLike) -> None:
         if self.transport is None or self.h2 is None:
@@ -225,7 +240,7 @@ class H3Protocol(QuicConnectionProtocol):
 
     def quic_event_received(self, event) -> None:
         if isinstance(event, HandshakeCompleted) and self._tls is None:
-            self._tls = TLS.extract_h3_tls_info(self._quic)
+            self._tls = TLS.extract_tls_info_h3(self._quic)
 
         if self.h3 is None:
             self.h3 = H3(self._quic, connection_id=self._quic.host_cid)
@@ -237,10 +252,14 @@ class H3Protocol(QuicConnectionProtocol):
     async def respond(self, request: Request) -> None:
         if self.h3 is None or request.h3 is None:
             return
+
         response = await process(self.handler.app, request)
-        file_path = self.h3.send(request.h3.stream_id, response)
-        if file_path is not None:
-            await self.send_file(request.h3.stream_id, file_path)
+
+        alt_body = self.h3.send(request.h3.stream_id, response)
+
+        if alt_body is not None:
+            await self.send_file(request.h3.stream_id, alt_body)
+
         else:
             self.transmit()
 
