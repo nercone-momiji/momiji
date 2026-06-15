@@ -272,9 +272,34 @@ class TLSInfo:
 class TLSConfig:
     certfile: str | None = None
     keyfile: str | None = None
-    ciphers: list[Cipher] = field(default_factory=lambda: [Cipher.ECDHE_ECDSA_AES128_GCM_SHA256, Cipher.ECDHE_ECDSA_AES256_GCM_SHA384, Cipher.ECDHE_ECDSA_CHACHA20_POLY1305])
-    groups: list[Group] = field(default_factory=lambda: [Group.X25519MLKEM768, Group.SECP384R1MLKEM1024, Group.SECP256R1MLKEM768, Group.MLKEM1024, Group.MLKEM768, Group.X25519, Group.prime256v1, Group.secp384r1])
     minimum_version: ssl.TLSVersion = ssl.TLSVersion.TLSv1_2
+    ciphers: list[Cipher] = field(default_factory=lambda: [
+        # TLS 1.3
+        Cipher.TLS_AES_128_GCM_SHA256,
+        Cipher.TLS_AES_256_GCM_SHA384,
+        Cipher.TLS_CHACHA20_POLY1305_SHA256,
+        # TLS 1.2 (ECDSA)
+        Cipher.ECDHE_ECDSA_AES128_GCM_SHA256,
+        Cipher.ECDHE_ECDSA_AES256_GCM_SHA384,
+        Cipher.ECDHE_ECDSA_CHACHA20_POLY1305,
+        # TLS 1.2 (RSA)
+        Cipher.ECDHE_RSA_AES128_GCM_SHA256,
+        Cipher.ECDHE_RSA_AES256_GCM_SHA384,
+        Cipher.ECDHE_RSA_CHACHA20_POLY1305
+    ])
+    groups: list[Group] = field(default_factory=lambda: [
+        # PQC (Hybrid)
+        Group.X25519MLKEM768,
+        Group.SECP384R1MLKEM1024,
+        Group.SECP256R1MLKEM768,
+        # PQC (Pure)
+        Group.MLKEM1024,
+        Group.MLKEM768,
+        # Classic
+        Group.X25519,
+        Group.prime256v1,
+        Group.secp384r1
+    ])
 
 class TLS:
     @staticmethod
@@ -301,7 +326,7 @@ class TLS:
 
     @staticmethod
     def set_ssl_groups(ctx: ssl.SSLContext, groups: list[Group]):
-        if hasattr(ctx, 'set_groups'):
+        if hasattr(ctx, 'set_groups') and groups:
             ctx.set_groups(":".join([group.value for group in groups]))
             return
 
