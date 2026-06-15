@@ -10,10 +10,4 @@ class H3Info:
     stream_id: int
 
 class H3:
-    @staticmethod
-    def parse(request: bytes) -> Request:
-        ...
-
-    @staticmethod
-    def build(response: Response) -> bytes | tuple[bytes, os.PathLike | None]:
-        ...
+    ...
