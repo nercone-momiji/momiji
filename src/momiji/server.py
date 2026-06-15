@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+import signal
 import socket
+import asyncio
 
 from .app import App
 from .config import Config
-from .http import Listener
+from .http import Listener, Handler
 
 class Server:
     def __init__(self, app: App, config: Config | None = None):
@@ -22,7 +24,16 @@ class Server:
         return sock
 
     def bind_socket(self, host: str, port: int, type: socket.SocketKind) -> socket.socket:
-        ...
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        sock = socket.socket(family, type)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if family == socket.AF_INET6:
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        sock.bind((host, port))
+        if type == socket.SOCK_STREAM:
+            sock.listen(socket.SOMAXCONN)
+        sock.setblocking(False)
+        return sock
 
     def parse_host_port(self, value: str) -> tuple[str, int]:
         host, _, port = value.rpartition(":")
@@ -50,7 +61,25 @@ class Server:
         return listeners
 
     def run(self):
-        ...
+        asyncio.run(self.serve())
 
     async def serve(self):
-        ...
+        listeners = self.listeners
+        handlers = [Handler(listener, self.app, self.config) for listener in listeners]
+
+        for handler in handlers:
+            await handler.start()
+
+        loop = asyncio.get_running_loop()
+        stop = loop.create_future()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop.set_result, None)
+
+        try:
+            await stop
+        finally:
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.remove_signal_handler(sig)
+            for handler in handlers:
+                await handler.stop()
