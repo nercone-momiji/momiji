@@ -13,6 +13,7 @@ from .http import Listener, Handler
 class Server:
     def __init__(self, app: App, middlewares: list[Middleware], config: Config | None = None):
         self.app = app
+        self.middlewares = middlewares
         self.config = config or Config()
 
     def bind_unix(self, path: os.PathLike) -> socket.socket:
@@ -119,10 +120,13 @@ class Server:
                     pass
 
     async def serve(self, listeners: list[Listener] | None = None):
-        handlers = [Handler(listener, self.app, self.config) for listener in (listeners if listeners is not None else self.listeners())]
+        handlers = [Handler(listener, self.app, self.middlewares, self.config) for listener in (listeners if listeners is not None else self.listeners())]
 
         for handler in handlers:
             await handler.start()
+
+        for middleware in self.middlewares:
+            await middleware.on_start()
 
         await self.app.on_start()
 
@@ -139,6 +143,9 @@ class Server:
                 loop.remove_signal_handler(sig)
 
             await self.app.on_stop()
+
+            for middleware in reversed(self.middlewares):
+                await middleware.on_stop()
 
             for handler in handlers:
                 await handler.stop()

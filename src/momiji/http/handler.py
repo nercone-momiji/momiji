@@ -20,7 +20,7 @@ from .websocket import WebSocket, compute_accept, parse_frames
 from ..tls import TLS, TLSInfo
 
 if TYPE_CHECKING:
-    from ..app import App
+    from ..app import App, Middleware
     from ..config import Config
 
 def parse_peername(transport: asyncio.BaseTransport) -> tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int]:
@@ -205,7 +205,7 @@ class TCPProtocol(asyncio.Protocol):
             await self.upgrade_websocket(request, ws_key)
             return
 
-        response = await process(self.handler.app, request)
+        response = await process(self.handler.app, request, middlewares=self.handler.middlewares)
 
         if "h3" in self.handler.config.protocols and self.handler.config.bind_quic:
             _, _, h3_port = self.handler.config.bind_quic[0].rpartition(':')
@@ -265,6 +265,11 @@ class TCPProtocol(asyncio.Protocol):
 
     async def run_websocket(self, request: Request, ws: WebSocket) -> None:
         try:
+            for middleware in self.handler.middlewares:
+                result = await middleware.on_websocket(request, ws)
+                if result is None:
+                    continue
+                request, ws = result
             await self.handler.app.on_websocket(request, ws)
         except Exception:
             pass
@@ -308,7 +313,7 @@ class TCPProtocol(asyncio.Protocol):
         if self.transport is None or self.h2 is None or request.h2 is None:
             return
 
-        response = await process(self.handler.app, request)
+        response = await process(self.handler.app, request, middlewares=self.handler.middlewares)
 
         if "h3" in self.handler.config.protocols and self.handler.config.bind_quic:
             _, _, h3_port = self.handler.config.bind_quic[0].rpartition(':')
@@ -461,7 +466,7 @@ class H3Protocol(QuicConnectionProtocol):
         if self.h3 is None or request.h3 is None:
             return
 
-        response = await process(self.handler.app, request)
+        response = await process(self.handler.app, request, middlewares=self.handler.middlewares)
 
         if response.is_streaming:
             await self.stream_h3(request.h3.stream_id, response)
@@ -505,8 +510,14 @@ class H3Protocol(QuicConnectionProtocol):
 
         asyncio.create_task(self.ws_read_h3(upgrade.stream_id, ws))
 
+        request = upgrade.request
         try:
-            await self.handler.app.on_websocket(upgrade.request, ws)
+            for middleware in self.handler.middlewares:
+                result = await middleware.on_websocket(request, ws)
+                if result is None:
+                    continue
+                request, ws = result
+            await self.handler.app.on_websocket(request, ws)
 
         except Exception:
             pass
@@ -573,9 +584,10 @@ class H3Protocol(QuicConnectionProtocol):
             self.transmit()
 
 class Handler:
-    def __init__(self, listener: Listener, app: App, config: Config):
+    def __init__(self, listener: Listener, app: App, middlewares: list[Middleware], config: Config):
         self.listener = listener
         self.app = app
+        self.middlewares = middlewares
         self.config = config
         self.tcp_server: asyncio.base_events.Server | None = None
         self.quic_server = None

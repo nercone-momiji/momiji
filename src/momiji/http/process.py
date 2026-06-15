@@ -21,7 +21,7 @@ from async_lru import alru_cache
 from .models import Request, Response
 
 if TYPE_CHECKING:
-    from ..app import App
+    from ..app import App, Middleware
 
 @alru_cache(maxsize=128)
 async def minimize_html(body: bytes) -> bytes:
@@ -228,15 +228,31 @@ def parse_range(value: str, total: int) -> tuple[int, int] | None:
 
     return (start, min(end, total - 1))
 
-async def process(app: App | None, request: Request, response: Response | None = None) -> Response:
+async def process(app: App | None, request: Request, response: Response | None = None, middlewares: list[Middleware] | None = None) -> Response:
     if response is None:
-        try:
-            result = app(request)
-            if inspect.isawaitable(result):
-                result = await result
-            response = result
-        except Exception:
-            response = Response(b"Internal Server Error", status_code=500, compression=False, minification=False)
+        for middleware in (middlewares or []):
+            try:
+                result = middleware(request)
+                if inspect.isawaitable(result):
+                    result = await result
+            except Exception:
+                response = Response(b"Internal Server Error", status_code=500, compression=False, minification=False)
+                break
+
+            if isinstance(result, Response):
+                response = result
+                break
+            elif isinstance(result, Request):
+                request = result
+
+        if response is None:
+            try:
+                result = app(request)
+                if inspect.isawaitable(result):
+                    result = await result
+                response = result
+            except Exception:
+                response = Response(b"Internal Server Error", status_code=500, compression=False, minification=False)
 
     response.headers.set("Server", "Momiji", override=False)
     response.headers.set("Content-Length", "0")
