@@ -38,7 +38,9 @@ class Server:
         return sock
 
     def parse_host_port(self, value: str) -> tuple[str, int]:
-        host, _, port = value.rpartition(":")
+        host, sep, port = value.rpartition(":")
+        if not sep:
+            raise ValueError(f"invalid bind address {value!r}: expected 'host:port'")
         return host.strip("[]"), int(port)
 
     def listeners(self) -> list[Listener]:

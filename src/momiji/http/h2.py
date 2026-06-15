@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 
 import h2.config
 import h2.connection
+import h2.errors
 import h2.events
 from h2.settings import SettingCodes
 
@@ -34,15 +35,19 @@ class Stream:
     body: bytearray = field(default_factory=bytearray)
 
 class H2:
-    def __init__(self, connection_id: bytes = b""):
+    def __init__(self, connection_id: bytes = b"", max_body_size: int = 16 * 1024 * 1024, max_concurrent_streams: int = 100, max_stream_resets: int = 1000):
         self.connection_id = connection_id
         self.connection = h2.connection.H2Connection(config=h2.config.H2Configuration(client_side=False, header_encoding="utf-8"))
         self.streams: dict[int, Stream] = {}
         self.ws_streams: dict[int, asyncio.Queue[bytes | None]] = {}
+        self.max_body_size = max_body_size
+        self.max_concurrent_streams = max_concurrent_streams
+        self.max_stream_resets = max_stream_resets
+        self.reset_count = 0
 
     def initiate(self) -> bytes:
         self.connection.initiate_connection()
-        self.connection.update_settings({SettingCodes.ENABLE_CONNECT_PROTOCOL: 1})
+        self.connection.update_settings({SettingCodes.ENABLE_CONNECT_PROTOCOL: 1, SettingCodes.MAX_CONCURRENT_STREAMS: self.max_concurrent_streams})
         return self.connection.data_to_send()
 
     def receive(self, data: bytes, *, client: tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int], scheme: Literal["http", "https"] = "https", secure: bool = True, tls: TLSInfo | None = None) -> tuple[bytes, list[Request], list[H2WSUpgrade], bool]:
@@ -95,7 +100,13 @@ class H2:
                     if stream is not None:
                         stream.body.extend(event.data)
                     self.connection.acknowledge_received_data(event.flow_controlled_length, event.stream_id)
-                    if event.stream_ended and event.stream_id in self.streams:
+                    if stream is not None and len(stream.body) > self.max_body_size:
+                        self.streams.pop(event.stream_id, None)
+                        try:
+                            self.connection.reset_stream(event.stream_id, error_code=h2.errors.ErrorCodes.ENHANCE_YOUR_CALM)
+                        except Exception:
+                            pass
+                    elif event.stream_ended and event.stream_id in self.streams:
                         completed.append(self.finalize(event.stream_id, client, secure, tls))
 
             elif isinstance(event, h2.events.StreamEnded):
@@ -106,6 +117,9 @@ class H2:
                     completed.append(self.finalize(event.stream_id, client, secure, tls))
 
             elif isinstance(event, h2.events.StreamReset):
+                self.reset_count += 1
+                if self.reset_count > self.max_stream_resets:
+                    closed = True
                 if event.stream_id in self.ws_streams:
                     self.ws_streams[event.stream_id].put_nowait(None)
                     del self.ws_streams[event.stream_id]

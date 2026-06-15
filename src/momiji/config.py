@@ -12,6 +12,13 @@ class Config:
 
     keepalive_timeout: float = 75
 
+    max_header_size: int = 64 * 1024
+    max_body_size: int = 16 * 1024 * 1024
+    max_websocket_message_size: int = 4 * 1024 * 1024
+
+    max_concurrent_streams: int = 100
+    max_stream_resets: int = 1000
+
     protocols: list[Literal["http/1.1", "h2", "h3"]] = field(default_factory=lambda: ["h3", "h2", "http/1.1"])
 
     bind_unix:  list[os.PathLike] = field(default_factory=list)

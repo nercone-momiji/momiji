@@ -10,7 +10,7 @@ from ..tls import TLSInfo
 
 class H1:
     @staticmethod
-    def parse(data: bytes, *, client: tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int], scheme: Literal["http", "https"] = "http", secure: bool = False, tls: TLSInfo | None = None) -> Request:
+    def parse(data: bytes, *, client: tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int], scheme: Literal["http", "https"] = "http", secure: bool = False, tls: TLSInfo | None = None, max_body_size: int | None = None) -> Request:
         head, sep, rest = data.partition(b"\r\n\r\n")
         if not sep:
             raise ValueError("incomplete HTTP/1.1 request: missing header terminator")
@@ -39,53 +39,71 @@ class H1:
         body: bytes | None = None
         transfer_encoding = (headers.get("Transfer-Encoding") or "").lower()
         content_length = headers.get("Content-Length")
+        is_chunked = "chunked" in [t.strip() for t in transfer_encoding.split(",")]
 
-        if "chunked" in transfer_encoding:
-            body = H1.decode_chunked(rest)
+        if is_chunked and content_length is not None:
+            raise ValueError("both Transfer-Encoding and Content-Length present")
+
+        if is_chunked:
+            body = H1.decode_chunked(rest, max_body_size=max_body_size)
 
         elif content_length is not None:
-            try:
-                n = int(content_length)
-            except ValueError:
+            if not (content_length.isascii() and content_length.isdigit()):
                 raise ValueError(f"invalid Content-Length: {content_length!r}")
-            if n < 0:
-                raise ValueError(f"negative Content-Length: {n}")
+            n = int(content_length)
+            if max_body_size is not None and n > max_body_size:
+                raise ValueError(f"Content-Length exceeds max_body_size: {n}")
             body = rest[:n] if n > 0 else None
 
         return Request(client=client, scheme=scheme, secure=secure, protocol="HTTP/1.1", method=method_b.decode("ascii"), target=target_b.decode("latin-1"), headers=headers, body=body, h2=None, h3=None, tls=tls)
 
     @staticmethod
-    def scan_chunked(data: bytes) -> tuple[bytes | None, int] | None:
+    def scan_chunked(data: bytes, max_body_size: int | None = None) -> tuple[bytes | None, int] | None:
         body = bytearray()
         i = 0
+
         while True:
             end = data.find(b"\r\n", i)
             if end == -1:
                 return None
+
             size_line = data[i:end].split(b";", 1)[0].strip()
+
             try:
                 size = int(size_line, 16)
             except ValueError:
                 raise ValueError(f"invalid chunk size: {size_line!r}")
+
+            if size < 0:
+                raise ValueError(f"negative chunk size: {size}")
+
+            if max_body_size is not None and len(body) + size > max_body_size:
+                raise ValueError("chunked body exceeds max_body_size")
+
             i = end + 2
             if size == 0:
                 while True:
                     line_end = data.find(b"\r\n", i)
                     if line_end == -1:
                         return None
+
                     is_empty = (line_end == i)
                     i = line_end + 2
+
                     if is_empty:
                         break
+
                 return bytes(body) if body else None, i
+
             if len(data) < i + size + 2:
                 return None
+
             body.extend(data[i:i + size])
             i += size + 2
 
     @staticmethod
-    def decode_chunked(data: bytes) -> bytes | None:
-        result = H1.scan_chunked(data)
+    def decode_chunked(data: bytes, max_body_size: int | None = None) -> bytes | None:
+        result = H1.scan_chunked(data, max_body_size=max_body_size)
         if result is None:
             raise ValueError("malformed chunked body: incomplete")
         body, _ = result
@@ -99,6 +117,8 @@ class H1:
             phrase = ""
         built = f"HTTP/1.1 {response.status_code}" + (f" {phrase}" if phrase else "") + "\r\n"
         for key, value in response.headers.items():
+            if any(c in key for c in "\r\n\x00") or any(c in value for c in "\r\n\x00"):
+                continue
             built += f"{key}: {value}\r\n"
         built += "\r\n"
         return built.encode("latin-1")

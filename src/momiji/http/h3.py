@@ -33,12 +33,13 @@ class Stream:
     body: bytearray = field(default_factory=bytearray)
 
 class H3:
-    def __init__(self, quic: QuicConnection, connection_id: bytes = b""):
+    def __init__(self, quic: QuicConnection, connection_id: bytes = b"", max_body_size: int = 16 * 1024 * 1024):
         self.connection_id = connection_id
         self.quic = quic
         self.connection = H3Connection(quic)
         self.streams: dict[int, Stream] = {}
         self.ws_streams: dict[int, asyncio.Queue[bytes | None]] = {}
+        self.max_body_size = max_body_size
 
     def receive(self, *, client: tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int], scheme: Literal["http", "https"] = "https", secure: bool = True, tls: TLSInfo | None = None) -> tuple[list[Request], list[H3WSUpgrade]]:
         completed: list[Request] = []
@@ -105,7 +106,14 @@ class H3:
                     if stream is not None:
                         stream.body.extend(event.data)
 
-                    if event.stream_ended and event.stream_id in self.streams:
+                    if stream is not None and len(stream.body) > self.max_body_size:
+                        self.streams.pop(event.stream_id, None)
+                        try:
+                            self.quic.reset_stream(event.stream_id, error_code=0x10C)
+                        except Exception:
+                            pass
+
+                    elif event.stream_ended and event.stream_id in self.streams:
                         completed.append(self.finalize(event.stream_id, client, secure, tls))
 
         return completed, ws_upgrades

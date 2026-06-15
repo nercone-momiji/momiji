@@ -46,7 +46,7 @@ class Frame:
         self.payload = payload
         self.masked = masked
 
-def parse_frames(buf: bytearray) -> list[Frame]:
+def parse_frames(buf: bytearray, max_payload_size: int | None = None) -> list[Frame]:
     frames: list[Frame] = []
 
     while len(buf) >= 2:
@@ -69,6 +69,9 @@ def parse_frames(buf: bytearray) -> list[Frame]:
                 break
             length = struct.unpack_from(">Q", buf, 2)[0]
             offset = 10
+
+        if max_payload_size is not None and length > max_payload_size:
+            raise ValueError("websocket frame exceeds max message size")
 
         mask_end = offset + (4 if masked else 0)
         if len(buf) < mask_end + length:
@@ -109,7 +112,7 @@ class PerMessageDeflate:
             compressed = compressed[:-4]
         return compressed
 
-    def decompress(self, data: bytes) -> bytes:
+    def decompress(self, data: bytes, max_size: int | None = None) -> bytes:
         data = data + b"\x00\x00\xff\xff"
         if self.client_no_context_takeover:
             ctx = zlib.decompressobj(wbits=-self.client_max_window_bits)
@@ -117,7 +120,12 @@ class PerMessageDeflate:
             if self.decompress_ctx is None:
                 self.decompress_ctx = zlib.decompressobj(wbits=-self.client_max_window_bits)
             ctx = self.decompress_ctx
-        return ctx.decompress(data)
+        if max_size is None:
+            return ctx.decompress(data)
+        result = ctx.decompress(data, max_size)
+        if ctx.unconsumed_tail:
+            raise ValueError("decompressed websocket message exceeds max message size")
+        return result
 
     def response_header(self) -> str:
         parts = ["permessage-deflate"]
@@ -168,11 +176,12 @@ class PerMessageDeflate:
         return None
 
 class WebSocket:
-    def __init__(self, transport: WriteTransport, *, require_masking: bool = True, subprotocol: str | None = None, deflate: PerMessageDeflate | None = None):
+    def __init__(self, transport: WriteTransport, *, require_masking: bool = True, subprotocol: str | None = None, deflate: PerMessageDeflate | None = None, max_message_size: int | None = None):
         self.transport = transport
         self.require_masking = require_masking
         self.subprotocol = subprotocol
         self.deflate = deflate
+        self.max_message_size = max_message_size
         self.queue: asyncio.Queue[bytes | None] = asyncio.Queue()
         self.closed = False
         self.fragments: bytearray = bytearray()
@@ -181,7 +190,7 @@ class WebSocket:
 
     def decompress(self, payload: bytes, rsv1: bool) -> bytes:
         if rsv1 and self.deflate is not None:
-            return self.deflate.decompress(payload)
+            return self.deflate.decompress(payload, self.max_message_size)
         return payload
 
     def feed_frame(self, frame: Frame) -> None:
@@ -196,6 +205,11 @@ class WebSocket:
         if frame.rsv1 and self.deflate is None:
             self.close_transport(1002)
             return
+
+        if frame.opcode in (Opcode.PING, Opcode.PONG, Opcode.CLOSE):
+            if not frame.fin or len(frame.payload) > 125:
+                self.close_transport(1002)
+                return
 
         if frame.opcode == Opcode.PING:
             if not self.closed:
@@ -216,7 +230,10 @@ class WebSocket:
 
         if frame.opcode in (Opcode.TEXT, Opcode.BINARY):
             if frame.fin:
-                self.queue.put_nowait(self.decompress(frame.payload, frame.rsv1))
+                try:
+                    self.queue.put_nowait(self.decompress(frame.payload, frame.rsv1))
+                except ValueError:
+                    self.close_transport(1009)
             else:
                 self.fragments = bytearray(frame.payload)
                 self.fragment_opcode = frame.opcode
@@ -224,8 +241,15 @@ class WebSocket:
 
         elif frame.opcode == Opcode.CONTINUATION:
             self.fragments.extend(frame.payload)
+            if self.max_message_size is not None and len(self.fragments) > self.max_message_size:
+                self.close_transport(1009)
+                return
             if frame.fin:
-                self.queue.put_nowait(self.decompress(bytes(self.fragments), self.fragment_rsv1))
+                try:
+                    self.queue.put_nowait(self.decompress(bytes(self.fragments), self.fragment_rsv1))
+                except ValueError:
+                    self.close_transport(1009)
+                    return
                 self.fragments = bytearray()
                 self.fragment_opcode = None
                 self.fragment_rsv1 = False

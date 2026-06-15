@@ -92,6 +92,8 @@ class TCPProtocol(asyncio.Protocol):
         self.ws: WebSocket | None = None
         self.ws_buffer: bytearray = bytearray()
         self.keepalive_handle: asyncio.TimerHandle | None = None
+        self.request_queue: asyncio.Queue[tuple[Request, bool] | None] = asyncio.Queue()
+        self.request_consumer: asyncio.Task | None = None
 
     def reset_keepalive(self) -> None:
         if self.keepalive_handle is not None:
@@ -124,7 +126,7 @@ class TCPProtocol(asyncio.Protocol):
 
             alpn = ssl_object.selected_alpn_protocol()
             if alpn == "h2" and "h2" in self.handler.config.protocols:
-                self.h2 = H2(connection_id=os.urandom(8))
+                self.h2 = H2(connection_id=os.urandom(8), max_body_size=self.handler.config.max_body_size, max_concurrent_streams=self.handler.config.max_concurrent_streams, max_stream_resets=self.handler.config.max_stream_resets)
                 self.transport.write(self.h2.initiate())
 
             elif "http/1.1" not in self.handler.config.protocols:
@@ -145,7 +147,12 @@ class TCPProtocol(asyncio.Protocol):
 
         if self.ws is not None:
             self.ws_buffer.extend(data)
-            for frame in parse_frames(self.ws_buffer):
+            try:
+                frames = parse_frames(self.ws_buffer, self.handler.config.max_websocket_message_size)
+            except ValueError:
+                self.ws.close_transport(1009)
+                return
+            for frame in frames:
                 self.ws.feed_frame(frame)
             return
 
@@ -172,16 +179,28 @@ class TCPProtocol(asyncio.Protocol):
 
             return
 
+        max_header = self.handler.config.max_header_size
+        max_body = self.handler.config.max_body_size
+
         self.buffer.extend(data)
         while True:
             head_end = self.buffer.find(b"\r\n\r\n")
             if head_end == -1:
+                if len(self.buffer) > max_header:
+                    self.send_error(431, "Request Header Fields Too Large")
+                    self.transport.close()
+                return
+
+            if head_end > max_header:
+                self.send_error(431, "Request Header Fields Too Large")
+                self.transport.close()
                 return
 
             body_start = head_end + 4
 
             transfer_encoding_raw = b""
             content_length_raw: bytes | None = None
+            duplicate_content_length = False
             for line in bytes(self.buffer[:head_end]).split(b"\r\n")[1:]:
                 name_b, sep_b, value_b = line.partition(b":")
                 if not sep_b:
@@ -190,18 +209,40 @@ class TCPProtocol(asyncio.Protocol):
                 if name_lower == b"transfer-encoding":
                     transfer_encoding_raw = value_b.strip().lower()
                 elif name_lower == b"content-length":
-                    content_length_raw = value_b.strip()
+                    value_stripped = value_b.strip()
+                    if content_length_raw is not None and value_stripped != content_length_raw:
+                        duplicate_content_length = True
+                    content_length_raw = value_stripped
 
-            if b"chunked" in transfer_encoding_raw:
-                scan = H1.scan_chunked(bytes(self.buffer[body_start:]))
+            is_chunked = b"chunked" in [t.strip() for t in transfer_encoding_raw.split(b",")]
+
+            if (is_chunked and content_length_raw is not None) or duplicate_content_length:
+                self.send_error(400, "Bad Request")
+                self.transport.close()
+                return
+
+            if is_chunked:
+                try:
+                    scan = H1.scan_chunked(bytes(self.buffer[body_start:]), max_body_size=max_body)
+                except ValueError:
+                    self.send_error(400, "Bad Request")
+                    self.transport.close()
+                    return
                 if scan is None:
+                    if len(self.buffer) - body_start > max_body:
+                        self.send_error(413, "Payload Too Large")
+                        self.transport.close()
                     return
                 consumed = body_start + scan[1]
 
             elif content_length_raw is not None:
-                try:
-                    expected = int(content_length_raw)
-                except ValueError:
+                if not (content_length_raw.isascii() and content_length_raw.isdigit()):
+                    self.send_error(400, "Bad Request")
+                    self.transport.close()
+                    return
+                expected = int(content_length_raw)
+                if expected > max_body:
+                    self.send_error(413, "Payload Too Large")
                     self.transport.close()
                     return
                 if len(self.buffer) - body_start < expected:
@@ -212,7 +253,7 @@ class TCPProtocol(asyncio.Protocol):
                 consumed = body_start
 
             try:
-                request = H1.parse(bytes(self.buffer[:consumed]), client=self.client, scheme=self.scheme, secure=self.secure, tls=self.tls)
+                request = H1.parse(bytes(self.buffer[:consumed]), client=self.client, scheme=self.scheme, secure=self.secure, tls=self.tls, max_body_size=max_body)
             except (ValueError, UnicodeDecodeError):
                 self.transport.close()
                 return
@@ -220,11 +261,34 @@ class TCPProtocol(asyncio.Protocol):
             del self.buffer[:consumed]
 
             connection_token = (request.headers.get("Connection") or "").lower()
-            self.keep_alive = connection_token != "close"
-            self.handler.create_task(self.respond_h1(request))
+            keep_alive = connection_token != "close"
 
-            if not self.keep_alive:
+            if self.request_consumer is None:
+                self.request_consumer = self.handler.create_task(self.consume_h1_requests())
+            self.request_queue.put_nowait((request, keep_alive))
+
+            if not keep_alive:
                 return
+
+    def send_error(self, status: int, phrase: str) -> None:
+        if self.transport is not None and not self.transport.is_closing():
+            self.transport.write(f"HTTP/1.1 {status} {phrase}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".encode("latin-1"))
+
+    async def consume_h1_requests(self) -> None:
+        while True:
+            item = await self.request_queue.get()
+            if item is None or self.transport is None:
+                break
+
+            request, keep_alive = item
+            self.keep_alive = keep_alive
+
+            await self.respond_h1(request)
+
+            if self.ws is not None:
+                break
+            if not self.keep_alive or self.transport is None:
+                break
 
     async def respond_h1(self, request: Request) -> None:
         if self.transport is None:
@@ -314,7 +378,7 @@ class TCPProtocol(asyncio.Protocol):
         lines.append(b"\r\n")
 
         self.transport.write(b"".join(lines))
-        ws = WebSocket(self.transport, subprotocol=subprotocol, deflate=deflate)
+        ws = WebSocket(self.transport, subprotocol=subprotocol, deflate=deflate, max_message_size=self.handler.config.max_websocket_message_size)
         self.ws = ws
         self.ws_buffer = bytearray()
         self.handler.create_task(self.run_websocket(request, ws))
@@ -340,32 +404,26 @@ class TCPProtocol(asyncio.Protocol):
             return
         loop = asyncio.get_running_loop()
 
-        def read_chunks() -> list[bytes]:
-            chunks: list[bytes] = []
+        fp = await loop.run_in_executor(None, lambda: open(os.fspath(path), "rb"))
+        try:
+            remaining = None
+            if file_range is not None:
+                start, end = file_range
+                await loop.run_in_executor(None, fp.seek, start)
+                remaining = end - start + 1
 
-            with open(os.fspath(path), "rb") as fp:
-                if file_range is not None:
-                    start, end = file_range
-                    fp.seek(start)
-                    remaining = end - start + 1
-                    while remaining > 0:
-                        chunk = fp.read(min(65536, remaining))
-                        if not chunk:
-                            break
-                        chunks.append(chunk)
-                        remaining -= len(chunk)
-
-                else:
-                    while True:
-                        chunk = fp.read(65536)
-                        if not chunk:
-                            break
-                        chunks.append(chunk)
-
-            return chunks
-
-        for chunk in await loop.run_in_executor(None, read_chunks):
-            self.transport.write(chunk)
+            while self.transport is not None:
+                size = 65536 if remaining is None else min(65536, remaining)
+                if size <= 0:
+                    break
+                chunk = await loop.run_in_executor(None, fp.read, size)
+                if not chunk:
+                    break
+                self.transport.write(chunk)
+                if remaining is not None:
+                    remaining -= len(chunk)
+        finally:
+            await loop.run_in_executor(None, fp.close)
 
     async def respond_h2(self, request: Request) -> None:
         if self.transport is None or self.h2 is None or request.h2 is None:
@@ -421,7 +479,7 @@ class TCPProtocol(asyncio.Protocol):
             self.transport.write(out)
 
         ws_transport = H2WebSocketTransport(self.h2, upgrade.stream_id, self.transport)
-        ws = WebSocket(ws_transport, require_masking=False, subprotocol=subprotocol, deflate=deflate)
+        ws = WebSocket(ws_transport, require_masking=False, subprotocol=subprotocol, deflate=deflate, max_message_size=self.handler.config.max_websocket_message_size)
 
         self.handler.create_task(self.read_ws_h2(upgrade.stream_id, ws))
         await self.run_websocket(upgrade.request, ws)
@@ -443,7 +501,12 @@ class TCPProtocol(asyncio.Protocol):
                 break
 
             buf.extend(chunk)
-            for frame in parse_frames(buf):
+            try:
+                frames = parse_frames(buf, self.handler.config.max_websocket_message_size)
+            except ValueError:
+                ws.close_transport(1009)
+                break
+            for frame in frames:
                 ws.feed_frame(frame)
 
     async def send_file_h2(self, stream_id: int, path: os.PathLike, file_range: tuple[int, int] | None = None) -> None:
@@ -451,36 +514,31 @@ class TCPProtocol(asyncio.Protocol):
             return
         loop = asyncio.get_running_loop()
 
-        def read_chunks() -> list[bytes]:
-            chunks: list[bytes] = []
+        fp = await loop.run_in_executor(None, lambda: open(os.fspath(path), "rb"))
+        sent_any = False
+        try:
+            remaining = None
+            if file_range is not None:
+                start, end = file_range
+                await loop.run_in_executor(None, fp.seek, start)
+                remaining = end - start + 1
 
-            with open(os.fspath(path), "rb") as fp:
-                if file_range is not None:
-                    start, end = file_range
-                    fp.seek(start)
-                    remaining = end - start + 1
-                    while remaining > 0:
-                        chunk = fp.read(min(65536, remaining))
-                        if not chunk:
-                            break
-                        chunks.append(chunk)
-                        remaining -= len(chunk)
+            pending = await loop.run_in_executor(None, fp.read, 65536 if remaining is None else min(65536, remaining))
+            while pending and self.transport is not None and self.h2 is not None:
+                if remaining is not None:
+                    remaining -= len(pending)
+                size = 65536 if remaining is None else min(65536, remaining)
+                nxt = await loop.run_in_executor(None, fp.read, size) if size > 0 else b""
+                is_last = not nxt
+                out = self.h2.send_chunk(stream_id, pending, end_stream=is_last)
+                if out and self.transport:
+                    self.transport.write(out)
+                sent_any = True
+                pending = nxt
+        finally:
+            await loop.run_in_executor(None, fp.close)
 
-                else:
-                    while True:
-                        chunk = fp.read(65536)
-                        if not chunk:
-                            break
-                        chunks.append(chunk)
-
-            return chunks
-
-        chunks = await loop.run_in_executor(None, read_chunks)
-        for i, chunk in enumerate(chunks):
-            out = self.h2.send_chunk(stream_id, chunk, end_stream=(i == len(chunks) - 1))
-            if out and self.transport:
-                self.transport.write(out)
-        if not chunks:
+        if not sent_any and self.h2 is not None:
             out = self.h2.send_chunk(stream_id, b"", end_stream=True)
             if out and self.transport:
                 self.transport.write(out)
@@ -504,6 +562,8 @@ class TCPProtocol(asyncio.Protocol):
         if self.ws is not None and not self.ws.closed:
             self.ws.queue.put_nowait(None)
 
+        self.request_queue.put_nowait(None)
+
         self.buffer.clear()
 
 class H3Protocol(QuicConnectionProtocol):
@@ -519,7 +579,7 @@ class H3Protocol(QuicConnectionProtocol):
             self.tls = TLS.extract_tls_info_h3(self._quic)
 
         if self.h3 is None:
-            self.h3 = H3(self._quic, connection_id=self._quic.host_cid)
+            self.h3 = H3(self._quic, connection_id=self._quic.host_cid, max_body_size=self.handler.config.max_body_size)
             self.client = parse_peername(self._transport)
 
         requests, ws_upgrades = self.h3.handle_event(event, client=self.client, scheme="https", secure=True, tls=self.tls)
@@ -576,7 +636,7 @@ class H3Protocol(QuicConnectionProtocol):
         self.transmit()
 
         ws_transport = H3WebSocketTransport(self.h3, upgrade.stream_id, self)
-        ws = WebSocket(ws_transport, require_masking=False, subprotocol=subprotocol, deflate=deflate)
+        ws = WebSocket(ws_transport, require_masking=False, subprotocol=subprotocol, deflate=deflate, max_message_size=self.handler.config.max_websocket_message_size)
 
         self.handler.create_task(self.ws_read_h3(upgrade.stream_id, ws))
 
@@ -615,7 +675,12 @@ class H3Protocol(QuicConnectionProtocol):
 
             buf.extend(chunk)
 
-            for frame in parse_frames(buf):
+            try:
+                frames = parse_frames(buf, self.handler.config.max_websocket_message_size)
+            except ValueError:
+                ws.close_transport(1009)
+                break
+            for frame in frames:
                 ws.feed_frame(frame)
 
     async def send_file(self, stream_id: int, path: os.PathLike, file_range: tuple[int, int] | None = None) -> None:
@@ -623,35 +688,31 @@ class H3Protocol(QuicConnectionProtocol):
             return
         loop = asyncio.get_running_loop()
 
-        def read_chunks() -> list[bytes]:
-            chunks: list[bytes] = []
+        fp = await loop.run_in_executor(None, lambda: open(os.fspath(path), "rb"))
+        sent_any = False
+        try:
+            remaining = None
+            if file_range is not None:
+                start, end = file_range
+                await loop.run_in_executor(None, fp.seek, start)
+                remaining = end - start + 1
 
-            with open(os.fspath(path), "rb") as fp:
-                if file_range is not None:
-                    start, end = file_range
-                    fp.seek(start)
-                    remaining = end - start + 1
-                    while remaining > 0:
-                        chunk = fp.read(min(65536, remaining))
-                        if not chunk:
-                            break
-                        chunks.append(chunk)
-                        remaining -= len(chunk)
+            pending = await loop.run_in_executor(None, fp.read, 65536 if remaining is None else min(65536, remaining))
+            while pending and self.h3 is not None:
+                if remaining is not None:
+                    remaining -= len(pending)
+                size = 65536 if remaining is None else min(65536, remaining)
+                nxt = await loop.run_in_executor(None, fp.read, size) if size > 0 else b""
+                is_last = not nxt
+                self.h3.send_chunk(stream_id, pending, end_stream=is_last)
+                self.transmit()
+                sent_any = True
+                pending = nxt
 
-                else:
-                    while True:
-                        chunk = fp.read(65536)
-                        if not chunk:
-                            break
-                        chunks.append(chunk)
+        finally:
+            await loop.run_in_executor(None, fp.close)
 
-            return chunks
-
-        chunks = await loop.run_in_executor(None, read_chunks)
-        for i, chunk in enumerate(chunks):
-            self.h3.send_chunk(stream_id, chunk, end_stream=(i == len(chunks) - 1))
-            self.transmit()
-        if not chunks:
+        if not sent_any and self.h3 is not None:
             self.h3.send_chunk(stream_id, b"", end_stream=True)
             self.transmit()
 

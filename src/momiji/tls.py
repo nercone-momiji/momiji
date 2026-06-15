@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ssl
+import sys
 import ctypes
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
@@ -306,7 +307,21 @@ class TLSConfig:
         Group.secp384r1
     ])
 
+class PyObjectHeader(ctypes.Structure):
+    _fields_ = [("ob_refcnt", ctypes.c_ssize_t), ("ob_type", ctypes.c_void_p)]
+
 class TLS:
+    @staticmethod
+    def get_ctx_pointer(ctx: ssl.SSLContext) -> int:
+        offset = ctypes.sizeof(PyObjectHeader)
+        if hasattr(sys, "getobjects"):
+            offset += 2 * ctypes.sizeof(ctypes.c_void_p)
+
+        ssl_ctx_ptr = ctypes.c_void_p.from_address(id(ctx) + offset).value
+        if not ssl_ctx_ptr:
+            raise RuntimeError("Failed to obtain SSL_CTX pointer from SSLContext")
+        return ssl_ctx_ptr
+
     @staticmethod
     def extract_tls_info_h3(quic_connection: QuicConnection) -> TLSInfo:
         cipher = None
@@ -349,10 +364,7 @@ class TLS:
             libssl.SSL_CTX_set1_groups_list.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             libssl.SSL_CTX_set1_groups_list.restype = ctypes.c_int
 
-            ptr_size = ctypes.sizeof(ctypes.c_void_p)
-            ssl_ctx_ptr = ctypes.c_void_p.from_address(id(ctx) + 2 * ptr_size).value
-            if ssl_ctx_ptr is None:
-                raise RuntimeError("Failed to obtain SSL_CTX pointer for group configuration")
+            ssl_ctx_ptr = TLS.get_ctx_pointer(ctx)
 
             result = libssl.SSL_CTX_set1_groups_list(ssl_ctx_ptr, ":".join([group.value for group in groups]).encode('ascii'))
             if result != 1:
@@ -372,10 +384,7 @@ class TLS:
             libssl.SSL_CTX_set_cipher_list.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             libssl.SSL_CTX_set_cipher_list.restype = ctypes.c_int
 
-            ptr_size = ctypes.sizeof(ctypes.c_void_p)
-            ssl_ctx_ptr = ctypes.c_void_p.from_address(id(ctx) + 2 * ptr_size).value
-            if ssl_ctx_ptr is None:
-                raise RuntimeError("Failed to obtain SSL_CTX pointer for cipher configuration")
+            ssl_ctx_ptr = TLS.get_ctx_pointer(ctx)
 
             result = libssl.SSL_CTX_set_cipher_list(ssl_ctx_ptr, ":".join([cipher.value for cipher in ciphers]).encode('ascii'))
             if result != 1:
@@ -395,10 +404,7 @@ class TLS:
             libssl.SSL_CTX_set_ciphersuites.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
             libssl.SSL_CTX_set_ciphersuites.restype = ctypes.c_int
 
-            ptr_size = ctypes.sizeof(ctypes.c_void_p)
-            ssl_ctx_ptr = ctypes.c_void_p.from_address(id(ctx) + 2 * ptr_size).value
-            if ssl_ctx_ptr is None:
-                raise RuntimeError("Failed to obtain SSL_CTX pointer for ciphersuite configuration")
+            ssl_ctx_ptr = TLS.get_ctx_pointer(ctx)
 
             result = libssl.SSL_CTX_set_ciphersuites(ssl_ctx_ptr, ":".join([cipher.value for cipher in ciphers]).encode('ascii'))
             if result != 1:

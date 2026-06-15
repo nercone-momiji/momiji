@@ -232,7 +232,7 @@ async def process(app: App | None, request: Request, response: Response | None =
     if response is None:
         for middleware in (middlewares or []):
             try:
-                result = middleware(request)
+                result = middleware.on_request(request)
                 if inspect.isawaitable(result):
                     result = await result
             except Exception:
@@ -254,11 +254,16 @@ async def process(app: App | None, request: Request, response: Response | None =
             except Exception:
                 response = Response(b"Internal Server Error", status_code=500, compression=False, minification=False)
 
+    if not isinstance(response, Response):
+        response = Response(b"Internal Server Error", status_code=500, compression=False, minification=False)
+
     response.headers.set("Server", "Momiji", override=False)
     response.headers.set("Content-Length", "0")
 
     if response.has_real_body:
-        response.body = await minimize(response) or response.body
+        minimized = await minimize(response)
+        if minimized is not None:
+            response.body = minimized
 
         range_header = request.headers.get("Range", "")
         if (range_header and request.method in ("GET", "HEAD") and response.status_code == 200):
@@ -280,13 +285,17 @@ async def process(app: App | None, request: Request, response: Response | None =
             response.headers.set("Content-Range", f"bytes {start}-{end}/{total}")
 
         if response.status_code != 206:
-            response.body = await compress(response, parse_accept_encoding(request.headers.get("Accept-Encoding", ""))) or response.body
+            compressed = await compress(response, parse_accept_encoding(request.headers.get("Accept-Encoding", "")))
+            if compressed is not None:
+                response.body = compressed
 
         response.headers.set("Content-Type", response.content_type or response.headers.get("Content-Type") or "application/octet-stream")
         response.headers.set("Content-Length", str(len(response.body)))
 
     elif response.is_streaming:
-        response.body = await compress(response, parse_accept_encoding(request.headers.get("Accept-Encoding", ""))) or response.body
+        compressed = await compress(response, parse_accept_encoding(request.headers.get("Accept-Encoding", "")))
+        if compressed is not None:
+            response.body = compressed
 
         response.headers.set("Content-Type", response.content_type or response.headers.get("Content-Type") or "application/octet-stream")
         response.headers.remove("Content-Length")
