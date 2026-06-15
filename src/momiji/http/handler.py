@@ -54,15 +54,22 @@ class TCPProtocol(asyncio.Protocol):
             self.scheme = "https"
             self.tls = TLS.extract_tls_info(ssl_object)
             alpn = ssl_object.selected_alpn_protocol()
-            if alpn == "h2":
+            if alpn == "h2" and "h2" in self.handler.config.protocols:
                 self.h2 = H2()
                 self.transport.write(self.h2.initiate())
+            elif "http/1.1" not in self.handler.config.protocols:
+                self.transport.close()
+                return
         else:
             self.secure = self.handler.listener.kind == "https"
             self.scheme = "https" if self.secure else "http"
 
     def data_received(self, data: bytes) -> None:
         if self.transport is None:
+            return
+
+        if self.h2 is None and "http/1.1" not in self.handler.config.protocols:
+            self.transport.close()
             return
 
         if self.h2 is not None:
