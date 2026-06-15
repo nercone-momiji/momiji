@@ -1,4 +1,5 @@
 import os
+from typing import Literal
 from dataclasses import dataclass, field
 from .tls import TLSConfig
 
@@ -6,7 +7,7 @@ from .tls import TLSConfig
 class Config:
     workers: int = 0
 
-    protocols: list[str] = field(default_factory=lambda: ["h3", "h2", "http/1.1"])
+    protocols: list[Literal["http/1.1", "h2", "h3"]] = field(default_factory=lambda: ["h3", "h2", "http/1.1"])
 
     bind_unix:  list[os.PathLike] = field(default_factory=list)
     bind_http:  list[str] = field(default_factory=lambda: ["127.0.0.1:80", "[::1]:80"])

@@ -40,30 +40,36 @@ class Server:
         host, _, port = value.rpartition(":")
         return host.strip("[]"), int(port)
 
-    @property
     def listeners(self) -> list[Listener]:
         listeners: list[Listener] = []
 
-        for path in self.config.bind_unix:
-            listeners.append(Listener(self.bind_unix(path), "unix"))
+        h1_enabled = "http/1.1" in self.config.protocols
+        h2_enabled = "h2" in self.config.protocols
+        h3_enabled = "h3" in self.config.protocols
 
-        for value in self.config.bind_http:
-            host, port = self.parse_host_port(value)
-            listeners.append(Listener(self.bind_socket(host, port, socket.SOCK_STREAM), "http"))
+        if h1_enabled:
+            for path in self.config.bind_unix:
+                listeners.append(Listener(self.bind_unix(path), "unix"))
 
-        for value in self.config.bind_https:
-            host, port = self.parse_host_port(value)
-            listeners.append(Listener(self.bind_socket(host, port, socket.SOCK_STREAM), "https"))
+            for value in self.config.bind_http:
+                host, port = self.parse_host_port(value)
+                listeners.append(Listener(self.bind_socket(host, port, socket.SOCK_STREAM), "http"))
 
-        for value in self.config.bind_quic:
-            host, port = self.parse_host_port(value)
-            listeners.append(Listener(self.bind_socket(host, port, socket.SOCK_DGRAM), "quic"))
+        if h1_enabled or h2_enabled:
+            for value in self.config.bind_https:
+                host, port = self.parse_host_port(value)
+                listeners.append(Listener(self.bind_socket(host, port, socket.SOCK_STREAM), "https"))
+
+        if h3_enabled:
+            for value in self.config.bind_quic:
+                host, port = self.parse_host_port(value)
+                listeners.append(Listener(self.bind_socket(host, port, socket.SOCK_DGRAM), "quic"))
 
         return listeners
 
     def run(self):
         workers = self.config.workers if self.config.workers > 0 else (os.cpu_count() or 1)
-        listeners = self.listeners
+        listeners = self.listeners()
 
         if workers == 1:
             uvloop.run(self.serve(listeners))
@@ -113,7 +119,7 @@ class Server:
                     pass
 
     async def serve(self, listeners: list[Listener] | None = None):
-        handlers = [Handler(listener, self.app, self.config) for listener in (listeners if listeners is not None else self.listeners)]
+        handlers = [Handler(listener, self.app, self.config) for listener in (listeners if listeners is not None else self.listeners())]
 
         for handler in handlers:
             await handler.start()

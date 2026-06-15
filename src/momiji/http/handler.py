@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Literal
 from aioquic.asyncio import QuicConnectionProtocol
 from aioquic.asyncio.server import QuicServer as AioquicServer
 from aioquic.quic.configuration import QuicConfiguration
+from aioquic.quic.events import HandshakeCompleted
 
 from .h1 import H1
 from .h2 import H2
@@ -65,11 +66,16 @@ class TCPProtocol(asyncio.Protocol):
             return
 
         if self.h2 is not None:
-            out, requests = self.h2.receive(data, client=self.client, scheme=self.scheme, secure=self.secure, tls=self.tls)
+            out, requests, closed = self.h2.receive(data, client=self.client, scheme=self.scheme, secure=self.secure, tls=self.tls)
             if out:
                 self.transport.write(out)
             for request in requests:
                 asyncio.create_task(self.respond_h2(request))
+            if closed:
+                goaway = self.h2.close()
+                if goaway:
+                    self.transport.write(goaway)
+                self.transport.close()
             return
 
         self.buffer.extend(data)
@@ -137,22 +143,14 @@ class TCPProtocol(asyncio.Protocol):
             head, body_path = result
             self.transport.write(head)
             if body_path is not None:
-                await self.send_file(body_path)
+                await self.send_file_h1(body_path)
         else:
             self.transport.write(result)
 
         if not self.keep_alive:
             self.transport.close()
 
-    async def respond_h2(self, request: Request) -> None:
-        if self.transport is None or self.h2 is None or request.h2 is None:
-            return
-        response = await process(self.handler.app, request)
-        out = self.h2.send(request.h2.stream_id, response)
-        if out:
-            self.transport.write(out)
-
-    async def send_file(self, path: os.PathLike) -> None:
+    async def send_file_h1(self, path: os.PathLike) -> None:
         if self.transport is None:
             return
         loop = asyncio.get_running_loop()
@@ -170,6 +168,41 @@ class TCPProtocol(asyncio.Protocol):
         for chunk in await loop.run_in_executor(None, read_chunks):
             self.transport.write(chunk)
 
+    async def respond_h2(self, request: Request) -> None:
+        if self.transport is None or self.h2 is None or request.h2 is None:
+            return
+        response = await process(self.handler.app, request)
+        out, file_path = self.h2.send(request.h2.stream_id, response)
+        if out:
+            self.transport.write(out)
+        if file_path is not None:
+            await self.send_file_h2(request.h2.stream_id, file_path)
+
+    async def send_file_h2(self, stream_id: int, path: os.PathLike) -> None:
+        if self.transport is None or self.h2 is None:
+            return
+        loop = asyncio.get_running_loop()
+
+        def read_chunks() -> list[bytes]:
+            chunks: list[bytes] = []
+            with open(os.fspath(path), "rb") as fp:
+                while True:
+                    chunk = fp.read(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            return chunks
+
+        chunks = await loop.run_in_executor(None, read_chunks)
+        for i, chunk in enumerate(chunks):
+            out = self.h2.send_chunk(stream_id, chunk, end_stream=(i == len(chunks) - 1))
+            if out and self.transport:
+                self.transport.write(out)
+        if not chunks:
+            out = self.h2.send_chunk(stream_id, b"", end_stream=True)
+            if out and self.transport:
+                self.transport.write(out)
+
     def connection_lost(self, exc: BaseException | None) -> None:
         self.transport = None
         self.h2 = None
@@ -184,6 +217,9 @@ class H3Protocol(QuicConnectionProtocol):
         self._tls: TLSInfo | None = None
 
     def quic_event_received(self, event) -> None:
+        if isinstance(event, HandshakeCompleted) and self._tls is None:
+            self._tls = TLS.extract_h3_tls_info(self._quic)
+
         if self.h3 is None:
             self.h3 = H3(self._quic, connection_id=self._quic.host_cid)
             self._client = parse_peername(self._transport)
@@ -195,8 +231,34 @@ class H3Protocol(QuicConnectionProtocol):
         if self.h3 is None or request.h3 is None:
             return
         response = await process(self.handler.app, request)
-        self.h3.send(request.h3.stream_id, response)
-        self.transmit()
+        file_path = self.h3.send(request.h3.stream_id, response)
+        if file_path is not None:
+            await self.send_file(request.h3.stream_id, file_path)
+        else:
+            self.transmit()
+
+    async def send_file(self, stream_id: int, path: os.PathLike) -> None:
+        if self.h3 is None:
+            return
+        loop = asyncio.get_running_loop()
+
+        def read_chunks() -> list[bytes]:
+            chunks: list[bytes] = []
+            with open(os.fspath(path), "rb") as fp:
+                while True:
+                    chunk = fp.read(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            return chunks
+
+        chunks = await loop.run_in_executor(None, read_chunks)
+        for i, chunk in enumerate(chunks):
+            self.h3.send_chunk(stream_id, chunk, end_stream=(i == len(chunks) - 1))
+            self.transmit()
+        if not chunks:
+            self.h3.send_chunk(stream_id, b"", end_stream=True)
+            self.transmit()
 
 class Handler:
     def __init__(self, listener: Listener, app: App, config: Config):

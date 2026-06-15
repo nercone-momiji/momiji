@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import ipaddress
 from typing import Literal
 from dataclasses import dataclass, field
@@ -35,9 +36,10 @@ class H2:
         self.connection.initiate_connection()
         return self.connection.data_to_send()
 
-    def receive(self, data: bytes, *, client: tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int], scheme: Literal["http", "https"] = "https", secure: bool = True, tls: TLSInfo | None = None) -> tuple[bytes, list[Request]]:
+    def receive(self, data: bytes, *, client: tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int], scheme: Literal["http", "https"] = "https", secure: bool = True, tls: TLSInfo | None = None) -> tuple[bytes, list[Request], bool]:
         events = self.connection.receive_data(data)
         completed: list[Request] = []
+        closed = False
 
         for event in events:
             if isinstance(event, h2.events.RequestReceived):
@@ -75,15 +77,16 @@ class H2:
 
             elif isinstance(event, h2.events.ConnectionTerminated):
                 self.streams.clear()
+                closed = True
 
-        return self.connection.data_to_send(), completed
+        return self.connection.data_to_send(), completed, closed
 
     def finalize(self, stream_id: int, client: tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int], secure: bool, tls: TLSInfo | None) -> Request:
         stream = self.streams.pop(stream_id)
         body = bytes(stream.body) if stream.body else None
         return Request(client=client, scheme=stream.scheme if stream.scheme in ("http", "https") else "https", secure=secure, protocol="HTTP/2.0", method=stream.method, target=stream.target, headers=stream.headers, body=body, h2=H2Info(connection_id=self.connection_id, stream_id=stream_id), h3=None, tls=tls)
 
-    def send(self, stream_id: int, response: Response) -> bytes:
+    def send(self, stream_id: int, response: Response) -> tuple[bytes, os.PathLike | None]:
         headers: list[tuple[str, str]] = [(":status", str(response.status_code))]
         for name, value in response.headers.items():
             lname = name.lower()
@@ -102,9 +105,26 @@ class H2:
                 self.connection.send_data(stream_id, chunk, end_stream=(offset + len(chunk) >= len(body)))
             if not body:
                 self.connection.end_stream(stream_id)
+            return self.connection.data_to_send(), None
+
+        elif response.body is not None:
+            self.connection.send_headers(stream_id, headers, end_stream=False)
+            return self.connection.data_to_send(), response.body
+
         else:
             self.connection.send_headers(stream_id, headers, end_stream=True)
+            return self.connection.data_to_send(), None
 
+    def send_chunk(self, stream_id: int, chunk: bytes, end_stream: bool) -> bytes:
+        if chunk:
+            max_frame = self.connection.max_outbound_frame_size
+            if max_frame <= 0:
+                max_frame = 16384
+            for offset in range(0, len(chunk), max_frame):
+                piece = chunk[offset:offset + max_frame]
+                self.connection.send_data(stream_id, piece, end_stream=end_stream and (offset + len(piece) >= len(chunk)))
+        elif end_stream:
+            self.connection.end_stream(stream_id)
         return self.connection.data_to_send()
 
     def close(self, error_code: int = 0) -> bytes:

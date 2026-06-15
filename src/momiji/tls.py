@@ -5,6 +5,7 @@ import ctypes
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 from dataclasses import dataclass, field
+from aioquic.quic.connection import QuicConnection
 
 if TYPE_CHECKING:
     from .config import Config
@@ -302,6 +303,15 @@ class TLSConfig:
     ])
 
 class TLS:
+    @staticmethod
+    def extract_tls_info_h3(quic_connection: QuicConnection) -> TLSInfo:
+        cipher = None
+        try:
+            cipher = CIPHER_MAP.get("TLS_" + quic_connection.tls.key_schedule.cipher_suite.name)
+        except Exception:
+            pass
+        return TLSInfo(version="TLSv1.3", cipher=cipher, group=None)
+
     @staticmethod
     def extract_tls_info(ssl_object: ssl.SSLObject | None) -> TLSInfo | None:
         if ssl_object is None:

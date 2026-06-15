@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import ipaddress
 from typing import Literal
 from dataclasses import dataclass, field
@@ -78,7 +79,7 @@ class H3:
         body = bytes(stream.body) if stream.body else None
         return Request(client=client, scheme=stream.scheme if stream.scheme in ("http", "https") else "https", secure=secure, protocol="HTTP/3.0", method=stream.method, target=stream.target, headers=stream.headers, body=body, h2=None, h3=H3Info(connection_id=self.connection_id, stream_id=stream_id), tls=tls)
 
-    def send(self, stream_id: int, response: Response) -> None:
+    def send(self, stream_id: int, response: Response) -> os.PathLike | None:
         headers: list[tuple[bytes, bytes]] = [(b":status", str(response.status_code).encode("ascii"))]
         for name, value in response.headers.items():
             lname = name.lower()
@@ -89,5 +90,15 @@ class H3:
         if response.has_real_body:
             self.connection.send_headers(stream_id, headers, end_stream=False)
             self.connection.send_data(stream_id, response.body, end_stream=True)
+            return None
+
+        elif response.body is not None:
+            self.connection.send_headers(stream_id, headers, end_stream=False)
+            return response.body
+
         else:
             self.connection.send_headers(stream_id, headers, end_stream=True)
+            return None
+
+    def send_chunk(self, stream_id: int, chunk: bytes, end_stream: bool) -> None:
+        self.connection.send_data(stream_id, chunk, end_stream=end_stream)
