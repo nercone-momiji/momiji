@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import socket
-from typing import Literal
 
 from .app import App
 from .config import Config
