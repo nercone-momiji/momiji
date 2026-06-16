@@ -246,7 +246,16 @@ class TCPProtocol(asyncio.Protocol):
 
             transfer_encoding_raw = transfer_encodings[0] if transfer_encodings else b""
             content_length_raw = content_lengths[0] if content_lengths else None
-            is_chunked = b"chunked" in [t.strip() for t in transfer_encoding_raw.split(b",")]
+
+            if transfer_encoding_raw:
+                te_tokens = [t.strip() for t in transfer_encoding_raw.split(b",") if t.strip()]
+                if te_tokens[-1:] != [b"chunked"] or te_tokens.count(b"chunked") != 1:
+                    self.send_error(400, "Bad Request")
+                    self.transport.close()
+                    return
+                is_chunked = True
+            else:
+                is_chunked = False
 
             if is_chunked and content_length_raw is not None:
                 self.send_error(400, "Bad Request")
@@ -479,7 +488,13 @@ class TCPProtocol(asyncio.Protocol):
             return
         loop = asyncio.get_running_loop()
 
-        fp = await loop.run_in_executor(None, lambda: open(os.fspath(path), "rb"))
+        try:
+            fp = await loop.run_in_executor(None, lambda: open(os.fspath(path), "rb"))
+        except OSError:
+            if self.transport is not None and not self.transport.is_closing():
+                self.transport.close()
+            return
+
         try:
             remaining = None
             if file_range is not None:
@@ -617,7 +632,14 @@ class TCPProtocol(asyncio.Protocol):
             return
         loop = asyncio.get_running_loop()
 
-        fp = await loop.run_in_executor(None, lambda: open(os.fspath(path), "rb"))
+        try:
+            fp = await loop.run_in_executor(None, lambda: open(os.fspath(path), "rb"))
+        except OSError:
+            out = self.h2.send_chunk(stream_id, b"", end_stream=True)
+            if out and self.transport is not None:
+                self.transport.write(out)
+            return
+
         sent_any = False
         try:
             remaining = None
@@ -694,7 +716,7 @@ class H3Protocol(QuicConnectionProtocol):
             self.handler.create_task(self.respond(request))
 
         for ws_upgrade in ws_upgrades:
-            self.handler.create_task(self.ws_response_h3(ws_upgrade))
+            self.handler.create_task(self.ws_response(ws_upgrade))
 
     async def respond(self, request: Request) -> None:
         if self.h3 is None or request.h3 is None:
@@ -703,7 +725,7 @@ class H3Protocol(QuicConnectionProtocol):
         response = await process(self.handler.app, request, middlewares=self.handler.middlewares)
 
         if response.is_streaming:
-            await self.stream_h3(request.h3.stream_id, response)
+            await self.stream(request.h3.stream_id, response)
             return
 
         alt_body = self.h3.send(request.h3.stream_id, response)
@@ -714,7 +736,7 @@ class H3Protocol(QuicConnectionProtocol):
         else:
             self.transmit()
 
-    async def stream_h3(self, stream_id: int, response: Response) -> None:
+    async def stream(self, stream_id: int, response: Response) -> None:
         if self.h3 is None:
             return
 
@@ -732,69 +754,18 @@ class H3Protocol(QuicConnectionProtocol):
                 self.h3.send_chunk(stream_id, b"", end_stream=True)
                 self.transmit()
 
-    async def ws_response_h3(self, upgrade: H3WSUpgrade) -> None:
-        if self.h3 is None:
-            return
-
-        subprotocol, deflate = negotiate_websocket(upgrade.request, self.handler.app)
-
-        self.h3.ws_accept(upgrade.stream_id, subprotocol=subprotocol, extensions=deflate.response_header() if deflate is not None else None)
-        self.transmit()
-
-        ws_transport = H3WebSocketTransport(self.h3, upgrade.stream_id, self)
-        ws = WebSocket(ws_transport, require_masking=False, subprotocol=subprotocol, deflate=deflate, max_message_size=self.handler.config.max_websocket_message_size)
-
-        self.handler.create_task(self.ws_read_h3(upgrade.stream_id, ws))
-
-        request = upgrade.request
-        self.handler.active_ws.add(ws)
-        try:
-            for middleware in self.handler.middlewares:
-                result = await middleware.on_websocket(request, ws)
-                if result is None:
-                    continue
-                request, ws = result
-            await self.handler.app.on_websocket(request, ws)
-
-        except Exception:
-            pass
-
-        finally:
-            self.handler.active_ws.discard(ws)
-            if not ws.closed:
-                await ws.close(1011)
-
-    async def ws_read_h3(self, stream_id: int, ws: WebSocket) -> None:
-        if self.h3 is None:
-            return
-
-        queue = self.h3.ws_streams.get(stream_id)
-        if queue is None:
-            return
-
-        buf = bytearray()
-        while True:
-            chunk = await queue.get()
-            if chunk is None:
-                ws.queue.put_nowait(None)
-                break
-
-            buf.extend(chunk)
-
-            try:
-                frames = parse_frames(buf, self.handler.config.max_websocket_message_size)
-            except ValueError:
-                ws.close_transport(1009)
-                break
-            for frame in frames:
-                ws.feed_frame(frame)
-
     async def send_file(self, stream_id: int, path: os.PathLike, file_range: tuple[int, int] | None = None) -> None:
         if self.h3 is None:
             return
         loop = asyncio.get_running_loop()
 
-        fp = await loop.run_in_executor(None, lambda: open(os.fspath(path), "rb"))
+        try:
+            fp = await loop.run_in_executor(None, lambda: open(os.fspath(path), "rb"))
+        except OSError:
+            self.h3.send_chunk(stream_id, b"", end_stream=True)
+            self.transmit()
+            return
+
         sent_any = False
         try:
             remaining = None
@@ -821,6 +792,63 @@ class H3Protocol(QuicConnectionProtocol):
         if not sent_any and self.h3 is not None:
             self.h3.send_chunk(stream_id, b"", end_stream=True)
             self.transmit()
+
+    async def ws_response(self, upgrade: H3WSUpgrade) -> None:
+        if self.h3 is None:
+            return
+
+        subprotocol, deflate = negotiate_websocket(upgrade.request, self.handler.app)
+
+        self.h3.ws_accept(upgrade.stream_id, subprotocol=subprotocol, extensions=deflate.response_header() if deflate is not None else None)
+        self.transmit()
+
+        ws_transport = H3WebSocketTransport(self.h3, upgrade.stream_id, self)
+        ws = WebSocket(ws_transport, require_masking=False, subprotocol=subprotocol, deflate=deflate, max_message_size=self.handler.config.max_websocket_message_size)
+
+        self.handler.create_task(self.ws_read(upgrade.stream_id, ws))
+
+        request = upgrade.request
+        self.handler.active_ws.add(ws)
+        try:
+            for middleware in self.handler.middlewares:
+                result = await middleware.on_websocket(request, ws)
+                if result is None:
+                    continue
+                request, ws = result
+            await self.handler.app.on_websocket(request, ws)
+
+        except Exception:
+            pass
+
+        finally:
+            self.handler.active_ws.discard(ws)
+            if not ws.closed:
+                await ws.close(1011)
+
+    async def ws_read(self, stream_id: int, ws: WebSocket) -> None:
+        if self.h3 is None:
+            return
+
+        queue = self.h3.ws_streams.get(stream_id)
+        if queue is None:
+            return
+
+        buf = bytearray()
+        while True:
+            chunk = await queue.get()
+            if chunk is None:
+                ws.queue.put_nowait(None)
+                break
+
+            buf.extend(chunk)
+
+            try:
+                frames = parse_frames(buf, self.handler.config.max_websocket_message_size)
+            except ValueError:
+                ws.close_transport(1009)
+                break
+            for frame in frames:
+                ws.feed_frame(frame)
 
 class Handler:
     def __init__(self, listener: Listener, app: App, middlewares: list[Middleware], config: Config):

@@ -39,7 +39,14 @@ class H1:
         body: bytes | None = None
         transfer_encoding = (headers.get("Transfer-Encoding") or "").lower()
         content_length = headers.get("Content-Length")
-        is_chunked = "chunked" in [t.strip() for t in transfer_encoding.split(",")]
+
+        if transfer_encoding:
+            te_tokens = [t.strip() for t in transfer_encoding.split(",") if t.strip()]
+            if te_tokens[-1:] != ["chunked"] or te_tokens.count("chunked") != 1:
+                raise ValueError(f"invalid Transfer-Encoding: {transfer_encoding!r}")
+            is_chunked = True
+        else:
+            is_chunked = False
 
         if is_chunked and content_length is not None:
             raise ValueError("both Transfer-Encoding and Content-Length present")
@@ -97,6 +104,9 @@ class H1:
 
             if len(data) < i + size + 2:
                 return None
+
+            if data[i + size:i + size + 2] != b"\r\n":
+                raise ValueError("malformed chunk: missing CRLF terminator")
 
             body.extend(data[i:i + size])
             i += size + 2

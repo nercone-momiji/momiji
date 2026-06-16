@@ -317,4 +317,10 @@ class WebSocket:
         self.closed = True
         payload = struct.pack(">H", code) + reason.encode("utf-8")
         self.write(build_frame(Opcode.CLOSE, payload))
-        self.close_transport()
+
+        try:
+            self.transport.close()
+        except Exception:
+            pass
+
+        self.queue.put_nowait(None)

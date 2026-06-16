@@ -24,19 +24,32 @@ from .models import Request, Response
 if TYPE_CHECKING:
     from ..app import App, Middleware
 
-@alru_cache(maxsize=128)
+def size_limited_cache(maxsize: int, max_cacheable_body_size: int = 1024 * 1024):
+    def decorator(fn):
+        cached = alru_cache(maxsize=maxsize)(fn)
+
+        async def wrapper(body: bytes) -> bytes:
+            if len(body) > max_cacheable_body_size:
+                return await fn(body)
+            return await cached(body)
+
+        return wrapper
+
+    return decorator
+
+@size_limited_cache(maxsize=128)
 async def minimize_html(body: bytes) -> bytes:
     return rhtmin.minify(body.decode("utf-8", errors="replace"), minify_js=True, minify_css=True, keep_comments=True, keep_html_and_head_opening_tags=True).encode("utf-8")
 
-@alru_cache(maxsize=128)
+@size_limited_cache(maxsize=128)
 async def minimize_css(body: bytes) -> bytes:
     return rcssmin.cssmin(body.decode("utf-8", errors="replace")).encode("utf-8")
 
-@alru_cache(maxsize=128)
+@size_limited_cache(maxsize=128)
 async def minimize_js(body: bytes) -> bytes:
     return rjsmin.jsmin(body.decode("utf-8", errors="replace")).encode("utf-8")
 
-@alru_cache(maxsize=64)
+@size_limited_cache(maxsize=64)
 async def minimize_svg(body: bytes) -> bytes:
     scour_options = scour.generateDefaultOptions()
     scour_options.newlines = False
@@ -44,19 +57,19 @@ async def minimize_svg(body: bytes) -> bytes:
     scour_options.strip_comments = True
     return scour.scourString(body.decode("utf-8", errors="replace"), scour_options).encode("utf-8")
 
-@alru_cache(maxsize=128)
+@size_limited_cache(maxsize=128)
 async def compress_zstd(body: bytes) -> bytes:
     return zstandard.ZstdCompressor(level=3).compress(body)
 
-@alru_cache(maxsize=128)
+@size_limited_cache(maxsize=128)
 async def compress_brotli(body: bytes) -> bytes:
     return brotlicffi.compress(body, quality=4)
 
-@alru_cache(maxsize=128)
+@size_limited_cache(maxsize=128)
 async def compress_gzip(body: bytes) -> bytes:
     return gzip.compress(body, compresslevel=6)
 
-@alru_cache(maxsize=128)
+@size_limited_cache(maxsize=128)
 async def compress_deflate(body: bytes) -> bytes:
     return zlib.compress(body, level=6)
 
@@ -130,7 +143,7 @@ def is_compressible(content_type: str | None) -> bool:
 
     return True
 
-async def compress(response: Response, accepted_encodings: dict[str, float]) -> bytes | AsyncIterator[bytes] | None:
+async def compress(response: Response, accepted_encodings: dict[str, float], max_compressible_file_size: int = 16 * 1024 * 1024) -> bytes | AsyncIterator[bytes] | None:
     if not (response.body is not None and response.compression and accepted_encodings):
         return None
 
@@ -178,6 +191,8 @@ async def compress(response: Response, accepted_encodings: dict[str, float]) -> 
         loop = asyncio.get_running_loop()
         try:
             path_str = os.fspath(response.body)
+            if await loop.run_in_executor(None, os.path.getsize, path_str) > max_compressible_file_size:
+                return None
             data = await loop.run_in_executor(None, lambda: open(path_str, "rb").read())
             compressed = await fn(data)
         except Exception:
@@ -249,11 +264,12 @@ def parse_range(value: str, total: int) -> tuple[int, int] | None:
     return (start, min(end, total - 1))
 
 def error_response(request: Request) -> Response:
-    response = Response(b"Internal Server Error" if request.method != "HEAD" else None, status_code=500, compression=False, minification=False)
+    body = b"Internal Server Error"
+    response = Response(body if request.method != "HEAD" else None, status_code=500, compression=False, minification=False)
     response.headers.set("Date", email.utils.formatdate(usegmt=True), override=False)
     response.headers.set("Server", "Momiji", override=False)
     response.headers.set("Content-Type", "text/plain; charset=utf-8")
-    response.headers.set("Content-Length", str(len(response.body)))
+    response.headers.set("Content-Length", str(len(body)))
     return response
 
 async def process(app: App | None, request: Request, response: Response | None = None, middlewares: list[Middleware] | None = None) -> Response:
