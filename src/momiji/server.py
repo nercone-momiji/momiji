@@ -29,6 +29,11 @@ class Server:
         family = socket.AF_INET6 if ":" in host else socket.AF_INET
         sock = socket.socket(family, type)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except OSError:
+                pass
         if family == socket.AF_INET6:
             sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
         sock.bind((host, port))
@@ -41,9 +46,11 @@ class Server:
         host, sep, port = value.rpartition(":")
         if not sep:
             raise ValueError(f"invalid bind address {value!r}: expected 'host:port'")
-        return host.strip("[]"), int(port)
+        if host.startswith("[") and host.endswith("]"):
+            host = host[1:-1]
+        return host, int(port)
 
-    def listeners(self) -> list[Listener]:
+    def listeners(self, *, include_quic: bool = True) -> list[Listener]:
         listeners: list[Listener] = []
 
         h1_enabled = "http/1.1" in self.config.protocols
@@ -63,19 +70,24 @@ class Server:
                 host, port = self.parse_host_port(value)
                 listeners.append(Listener(self.bind_socket(host, port, socket.SOCK_STREAM), "https"))
 
-        if h3_enabled:
+        if h3_enabled and include_quic:
+            listeners.extend(self.quic_listeners())
+
+        return listeners
+
+    def quic_listeners(self) -> list[Listener]:
+        listeners: list[Listener] = []
+        if "h3" in self.config.protocols:
             for value in self.config.bind_quic:
                 host, port = self.parse_host_port(value)
                 listeners.append(Listener(self.bind_socket(host, port, socket.SOCK_DGRAM), "quic"))
-
         return listeners
 
     def run(self):
         workers = self.config.workers if self.config.workers > 0 else (os.cpu_count() or 1)
-        listeners = self.listeners()
 
         if workers == 1:
-            uvloop.run(self.serve(listeners))
+            uvloop.run(self.serve(self.listeners()))
             return
 
         if not hasattr(os, "fork"):
@@ -84,11 +96,13 @@ class Server:
         alive: set[int] = set()
         shutting_down = False
 
+        shared = self.listeners(include_quic=False)
+
         def spawn_worker() -> int:
             pid = os.fork()
             if pid == 0:
                 try:
-                    uvloop.run(self.serve(listeners))
+                    uvloop.run(self.serve(shared + self.quic_listeners()))
                 except KeyboardInterrupt:
                     pass
                 finally:

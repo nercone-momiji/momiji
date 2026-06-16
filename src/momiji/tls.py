@@ -336,15 +336,10 @@ class TLS:
         if ssl_object is None:
             return None
 
-        if hasattr(ssl_object, 'version'):
-            version = VERSION_MAP.get(ssl_object.version() or "")
-        else:
-            version = None
+        version = VERSION_MAP.get(ssl_object.version() or "")
 
-        if hasattr(ssl_object, 'cipher'):
-            cipher = CIPHER_MAP.get(ssl_object.cipher()[0])
-        else:
-            cipher = None
+        cipher_tuple = ssl_object.cipher()
+        cipher = CIPHER_MAP.get(cipher_tuple[0]) if cipher_tuple else None
 
         if hasattr(ssl_object, 'group'):
             group = GROUP_MAP.get(ssl_object.group())

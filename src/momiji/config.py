@@ -14,6 +14,9 @@ class Config:
 
     max_header_size: int = 64 * 1024
     max_body_size: int = 16 * 1024 * 1024
+
+    max_stream_buffer_size: int = 1024 * 1024
+    max_pipeline_buffer_len: int = 100
     max_websocket_message_size: int = 4 * 1024 * 1024
 
     max_concurrent_streams: int = 100

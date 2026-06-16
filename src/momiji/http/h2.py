@@ -44,6 +44,9 @@ class H2:
         self.max_concurrent_streams = max_concurrent_streams
         self.max_stream_resets = max_stream_resets
         self.reset_count = 0
+        self.send_buffers: dict[int, bytearray] = {}
+        self.send_ended: dict[int, bool] = {}
+        self.flow_control_event = asyncio.Event()
 
     def initiate(self) -> bytes:
         self.connection.initiate_connection()
@@ -125,15 +128,93 @@ class H2:
                     del self.ws_streams[event.stream_id]
                 else:
                     self.streams.pop(event.stream_id, None)
+                self.discard_send(event.stream_id)
+
+            elif isinstance(event, h2.events.WindowUpdated):
+                if event.stream_id == 0:
+                    for sid in list(self.send_buffers.keys()):
+                        self.pump(sid)
+                else:
+                    self.pump(event.stream_id)
 
             elif isinstance(event, h2.events.ConnectionTerminated):
                 for queue in self.ws_streams.values():
                     queue.put_nowait(None)
                 self.ws_streams.clear()
                 self.streams.clear()
+                self.send_buffers.clear()
+                self.send_ended.clear()
                 closed = True
 
+        for sid in list(self.send_buffers.keys()):
+            self.pump(sid)
+
+        self.flow_control_event.set()
+
         return self.connection.data_to_send(), completed, ws_upgrades, closed
+
+    def enqueue(self, stream_id: int, data: bytes, end_stream: bool) -> None:
+        buf = self.send_buffers.get(stream_id)
+        if buf is None:
+            buf = bytearray()
+            self.send_buffers[stream_id] = buf
+        buf.extend(data)
+        if end_stream:
+            self.send_ended[stream_id] = True
+
+    def discard_send(self, stream_id: int) -> None:
+        self.send_buffers.pop(stream_id, None)
+        self.send_ended.pop(stream_id, None)
+
+    def pump(self, stream_id: int) -> None:
+        buf = self.send_buffers.get(stream_id)
+        ended = self.send_ended.get(stream_id, False)
+
+        if buf is None:
+            if ended:
+                try:
+                    self.connection.end_stream(stream_id)
+                except Exception:
+                    pass
+                self.send_ended.pop(stream_id, None)
+            return
+
+        try:
+            while buf:
+                window = self.connection.local_flow_control_window(stream_id)
+                if window <= 0:
+                    return
+                max_frame = self.connection.max_outbound_frame_size or 16384
+                size = min(len(buf), window, max_frame)
+                chunk = bytes(buf[:size])
+                del buf[:size]
+                end = ended and not buf
+                self.connection.send_data(stream_id, chunk, end_stream=end)
+                if end:
+                    self.discard_send(stream_id)
+                    return
+
+            if ended:
+                self.connection.end_stream(stream_id)
+                self.discard_send(stream_id)
+
+        except Exception:
+            self.discard_send(stream_id)
+
+    def stream_buffered(self, stream_id: int) -> int:
+        buf = self.send_buffers.get(stream_id)
+        return len(buf) if buf else 0
+
+    def build_headers(self, response: Response) -> list[tuple[str, str]]:
+        headers: list[tuple[str, str]] = [(":status", str(response.status_code))]
+        for name, value in response.headers.items():
+            lname = name.lower()
+            if lname in ("connection", "transfer-encoding", "keep-alive", "upgrade", "proxy-connection"):
+                continue
+            if any(c in lname for c in "\r\n\x00") or any(c in value for c in "\r\n\x00"):
+                continue
+            headers.append((lname, value))
+        return headers
 
     def finalize(self, stream_id: int, client: tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int], secure: bool, tls: TLSInfo | None) -> Request:
         stream = self.streams.pop(stream_id)
@@ -141,24 +222,12 @@ class H2:
         return Request(client=client, scheme=stream.scheme if stream.scheme in ("http", "https") else "https", secure=secure, protocol="HTTP/2.0", method=stream.method, target=stream.target, headers=stream.headers, body=body, h2=H2Info(connection_id=self.connection_id, stream_id=stream_id), h3=None, tls=tls)
 
     def send(self, stream_id: int, response: Response) -> tuple[bytes, os.PathLike | None]:
-        headers: list[tuple[str, str]] = [(":status", str(response.status_code))]
-        for name, value in response.headers.items():
-            lname = name.lower()
-            if lname in ("connection", "transfer-encoding", "keep-alive", "upgrade", "proxy-connection"):
-                continue
-            headers.append((lname, value))
+        headers = self.build_headers(response)
 
         if response.has_real_body:
             self.connection.send_headers(stream_id, headers, end_stream=False)
-            body: bytes = response.body
-            max_frame = self.connection.max_outbound_frame_size
-            if max_frame <= 0:
-                max_frame = 16384
-            for offset in range(0, len(body), max_frame):
-                chunk = body[offset:offset + max_frame]
-                self.connection.send_data(stream_id, chunk, end_stream=(offset + len(chunk) >= len(body)))
-            if not body:
-                self.connection.end_stream(stream_id)
+            self.enqueue(stream_id, response.body, end_stream=True)
+            self.pump(stream_id)
             return self.connection.data_to_send(), None
 
         elif response.body is not None:
@@ -170,27 +239,12 @@ class H2:
             return self.connection.data_to_send(), None
 
     def send_headers(self, stream_id: int, response: Response) -> bytes:
-        headers: list[tuple[str, str]] = [(":status", str(response.status_code))]
-
-        for name, value in response.headers.items():
-            lname = name.lower()
-            if lname in ("connection", "transfer-encoding", "keep-alive", "upgrade", "proxy-connection"):
-                continue
-            headers.append((lname, value))
-
-        self.connection.send_headers(stream_id, headers, end_stream=False)
+        self.connection.send_headers(stream_id, self.build_headers(response), end_stream=False)
         return self.connection.data_to_send()
 
     def send_chunk(self, stream_id: int, chunk: bytes, end_stream: bool) -> bytes:
-        if chunk:
-            max_frame = self.connection.max_outbound_frame_size
-            if max_frame <= 0:
-                max_frame = 16384
-            for offset in range(0, len(chunk), max_frame):
-                piece = chunk[offset:offset + max_frame]
-                self.connection.send_data(stream_id, piece, end_stream=end_stream and (offset + len(piece) >= len(chunk)))
-        elif end_stream:
-            self.connection.end_stream(stream_id)
+        self.enqueue(stream_id, chunk, end_stream)
+        self.pump(stream_id)
         return self.connection.data_to_send()
 
     def ws_accept(self, stream_id: int, subprotocol: str | None = None, extensions: str | None = None) -> bytes:
@@ -203,20 +257,14 @@ class H2:
         return self.connection.data_to_send()
 
     def ws_send(self, stream_id: int, data: bytes) -> bytes:
-        max_frame = self.connection.max_outbound_frame_size
-        if max_frame <= 0:
-            max_frame = 16384
-        for offset in range(0, len(data), max_frame):
-            piece = data[offset:offset + max_frame]
-            self.connection.send_data(stream_id, piece, end_stream=False)
+        self.enqueue(stream_id, data, end_stream=False)
+        self.pump(stream_id)
         return self.connection.data_to_send()
 
     def ws_close(self, stream_id: int) -> bytes:
         self.ws_streams.pop(stream_id, None)
-        try:
-            self.connection.end_stream(stream_id)
-        except Exception:
-            pass
+        self.send_ended[stream_id] = True
+        self.pump(stream_id)
         return self.connection.data_to_send()
 
     def close(self, error_code: int = 0) -> bytes:

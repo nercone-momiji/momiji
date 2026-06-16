@@ -8,6 +8,7 @@ import inspect
 import mimetypes
 import zstandard
 import brotlicffi
+import email.utils
 
 import minify_html as rhtmin
 import rjsmin
@@ -115,8 +116,28 @@ async def minimize(response: Response) -> bytes | None:
             return None
     return None
 
+def is_compressible(content_type: str | None) -> bool:
+    if not content_type:
+        return True
+
+    ct = content_type.split(";", 1)[0].strip().lower()
+
+    if ct.startswith(("image/", "video/", "audio/")):
+        return ct == "image/svg+xml"
+
+    elif ct in ("application/zip", "application/gzip", "application/x-gzip", "application/zstd", "application/x-zstd", "application/x-bzip2", "application/x-xz", "application/x-7z-compressed", "application/x-rar-compressed", "application/pdf", "application/ogg", "font/woff", "font/woff2"):
+        return False
+
+    return True
+
 async def compress(response: Response, accepted_encodings: dict[str, float]) -> bytes | AsyncIterator[bytes] | None:
     if not (response.body is not None and response.compression and accepted_encodings):
+        return None
+
+    if "Content-Encoding" in response.headers:
+        return None
+
+    if not is_compressible(response.content_type or response.headers.get("Content-Type")):
         return None
 
     candidates: list[tuple[str, object, object, int]] = [
@@ -227,6 +248,14 @@ def parse_range(value: str, total: int) -> tuple[int, int] | None:
 
     return (start, min(end, total - 1))
 
+def error_response(request: Request) -> Response:
+    response = Response(b"Internal Server Error" if request.method != "HEAD" else None, status_code=500, compression=False, minification=False)
+    response.headers.set("Date", email.utils.formatdate(usegmt=True), override=False)
+    response.headers.set("Server", "Momiji", override=False)
+    response.headers.set("Content-Type", "text/plain; charset=utf-8")
+    response.headers.set("Content-Length", str(len(response.body)))
+    return response
+
 async def process(app: App | None, request: Request, response: Response | None = None, middlewares: list[Middleware] | None = None) -> Response:
     if response is None:
         for middleware in (middlewares or []):
@@ -256,90 +285,98 @@ async def process(app: App | None, request: Request, response: Response | None =
     if not isinstance(response, Response):
         response = Response(b"Internal Server Error", status_code=500, compression=False, minification=False)
 
+    response.headers.set("Date", email.utils.formatdate(usegmt=True), override=False)
     response.headers.set("Server", "Momiji", override=False)
     response.headers.set("Content-Length", "0")
 
-    if response.has_real_body:
-        minimized = await minimize(response)
-        if minimized is not None:
-            response.body = minimized
+    try:
+        if response.has_real_body:
+            minimized = await minimize(response)
+            if minimized is not None:
+                response.body = minimized
 
-        range_header = request.headers.get("Range", "")
-        if (range_header and request.method in ("GET", "HEAD") and response.status_code == 200):
-            total = len(response.body)
-            parsed = parse_range(range_header, total)
+            range_header = request.headers.get("Range", "")
+            if (range_header and request.method in ("GET", "HEAD") and response.status_code == 200):
+                total = len(response.body)
+                parsed = parse_range(range_header, total)
+
+                response.headers.set("Accept-Ranges", "bytes")
+
+                if parsed is None:
+                    response.status_code = 416
+                    response.headers.set("Content-Range", f"bytes */{total}")
+                    response.body = b""
+                    response.headers.set("Content-Length", "0")
+                    return response
+
+                start, end = parsed
+                response.body = response.body[start:end + 1]
+                response.status_code = 206
+                response.headers.set("Content-Range", f"bytes {start}-{end}/{total}")
+
+            if response.status_code != 206:
+                compressed = await compress(response, parse_accept_encoding(request.headers.get("Accept-Encoding", "")))
+                if compressed is not None:
+                    response.body = compressed
+
+            response.headers.set("Content-Type", response.content_type or response.headers.get("Content-Type") or "application/octet-stream")
+            response.headers.set("Content-Length", str(len(response.body)))
+
+        elif response.is_streaming:
+            compressed = await compress(response, parse_accept_encoding(request.headers.get("Accept-Encoding", "")))
+            if compressed is not None:
+                response.body = compressed
+
+            response.headers.set("Content-Type", response.content_type or response.headers.get("Content-Type") or "application/octet-stream")
+            response.headers.remove("Content-Length")
+
+            if request.protocol == "HTTP/1.1":
+                response.headers.set("Transfer-Encoding", "chunked")
+
+        elif response.body is not None:
+            loop = asyncio.get_running_loop()
+            path = os.fspath(response.body)
+
+            try:
+                mime, _ = mimetypes.guess_type(path)
+            except OSError:
+                mime = None
+
+            total = await loop.run_in_executor(None, os.path.getsize, path)
 
             response.headers.set("Accept-Ranges", "bytes")
+            response.headers.set("Content-Type", response.content_type or response.headers.get("Content-Type") or mime or "application/octet-stream")
 
-            if parsed is None:
-                response.status_code = 416
-                response.headers.set("Content-Range", f"bytes */{total}")
-                response.body = b""
-                response.headers.set("Content-Length", "0")
-                return response
+            range_header = request.headers.get("Range", "")
+            if (range_header and request.method in ("GET", "HEAD") and response.status_code == 200):
+                parsed = parse_range(range_header, total)
+                if parsed is None:
+                    response.status_code = 416
+                    response.headers.set("Content-Range", f"bytes */{total}")
+                    response.body = None
+                    response.headers.set("Content-Length", "0")
+                    return response
 
-            start, end = parsed
-            response.body = response.body[start:end + 1]
-            response.status_code = 206
-            response.headers.set("Content-Range", f"bytes {start}-{end}/{total}")
+                start, end = parsed
+                response.file_range = (start, end)
+                response.status_code = 206
+                response.headers.set("Content-Range", f"bytes {start}-{end}/{total}")
+                response.headers.set("Content-Length", str(end - start + 1))
 
-        if response.status_code != 206:
-            compressed = await compress(response, parse_accept_encoding(request.headers.get("Accept-Encoding", "")))
-            if compressed is not None:
-                response.body = compressed
-
-        response.headers.set("Content-Type", response.content_type or response.headers.get("Content-Type") or "application/octet-stream")
-        response.headers.set("Content-Length", str(len(response.body)))
-
-    elif response.is_streaming:
-        compressed = await compress(response, parse_accept_encoding(request.headers.get("Accept-Encoding", "")))
-        if compressed is not None:
-            response.body = compressed
-
-        response.headers.set("Content-Type", response.content_type or response.headers.get("Content-Type") or "application/octet-stream")
-        response.headers.remove("Content-Length")
-
-        if request.protocol == "HTTP/1.1":
-            response.headers.set("Transfer-Encoding", "chunked")
-
-    elif response.body is not None:
-        try:
-            mime, _ = mimetypes.guess_type(os.fspath(response.body))
-        except OSError:
-            mime = None
-
-        total = os.path.getsize(os.fspath(response.body))
-
-        response.headers.set("Accept-Ranges", "bytes")
-        response.headers.set("Content-Type", response.content_type or response.headers.get("Content-Type") or mime or "application/octet-stream")
-
-        range_header = request.headers.get("Range", "")
-        if (range_header and request.method in ("GET", "HEAD") and response.status_code == 200):
-            parsed = parse_range(range_header, total)
-            if parsed is None:
-                response.status_code = 416
-                response.headers.set("Content-Range", f"bytes */{total}")
-                response.body = None
-                response.headers.set("Content-Length", "0")
-                return response
-
-            start, end = parsed
-            response.file_range = (start, end)
-            response.status_code = 206
-            response.headers.set("Content-Range", f"bytes {start}-{end}/{total}")
-            response.headers.set("Content-Length", str(end - start + 1))
-
-        else:
-            compressed = await compress(response, parse_accept_encoding(request.headers.get("Accept-Encoding", "")))
-            if compressed is not None:
-                response.body = compressed
-                response.headers.remove("Accept-Ranges")
-                response.headers.set("Content-Length", str(len(compressed)))
             else:
-                response.headers.set("Content-Length", str(total))
+                compressed = await compress(response, parse_accept_encoding(request.headers.get("Accept-Encoding", "")))
+                if compressed is not None:
+                    response.body = compressed
+                    response.headers.remove("Accept-Ranges")
+                    response.headers.set("Content-Length", str(len(compressed)))
+                else:
+                    response.headers.set("Content-Length", str(total))
 
-    if response.headers.get("Content-Type", "").startswith("text/") and "charset=" not in response.headers.get("Content-Type", ""):
-        response.headers.set("Content-Type", response.headers.get("Content-Type", "") + "; charset=utf-8")
+        if response.headers.get("Content-Type", "").startswith("text/") and "charset=" not in response.headers.get("Content-Type", ""):
+            response.headers.set("Content-Type", response.headers.get("Content-Type", "") + "; charset=utf-8")
+
+    except Exception:
+        return error_response(request)
 
     if request.method == "HEAD":
         if response.is_streaming:

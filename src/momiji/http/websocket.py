@@ -193,6 +193,12 @@ class WebSocket:
             return self.deflate.decompress(payload, self.max_message_size)
         return payload
 
+    def write(self, data: bytes) -> None:
+        try:
+            self.transport.write(data)
+        except Exception:
+            self.closed = True
+
     def feed_frame(self, frame: Frame) -> None:
         if self.require_masking and not frame.masked:
             self.close_transport(1002)
@@ -213,7 +219,7 @@ class WebSocket:
 
         if frame.opcode == Opcode.PING:
             if not self.closed:
-                self.transport.write(build_frame(Opcode.PONG, frame.payload))
+                self.write(build_frame(Opcode.PONG, frame.payload))
             return
 
         if frame.opcode == Opcode.PONG:
@@ -223,33 +229,47 @@ class WebSocket:
             if not self.closed:
                 self.closed = True
                 echo = frame.payload[:2] if len(frame.payload) >= 2 else b""
-                self.transport.write(build_frame(Opcode.CLOSE, echo))
-                self.transport.close()
+                self.write(build_frame(Opcode.CLOSE, echo))
+                try:
+                    self.transport.close()
+                except Exception:
+                    pass
             self.queue.put_nowait(None)
             return
 
         if frame.opcode in (Opcode.TEXT, Opcode.BINARY):
+            if self.fragment_opcode is not None:
+                self.close_transport(1002)
+                return
+
             if frame.fin:
                 try:
                     self.queue.put_nowait(self.decompress(frame.payload, frame.rsv1))
                 except ValueError:
                     self.close_transport(1009)
+
             else:
                 self.fragments = bytearray(frame.payload)
                 self.fragment_opcode = frame.opcode
                 self.fragment_rsv1 = frame.rsv1
 
         elif frame.opcode == Opcode.CONTINUATION:
+            if self.fragment_opcode is None:
+                self.close_transport(1002)
+                return
+
             self.fragments.extend(frame.payload)
             if self.max_message_size is not None and len(self.fragments) > self.max_message_size:
                 self.close_transport(1009)
                 return
+
             if frame.fin:
                 try:
                     self.queue.put_nowait(self.decompress(bytes(self.fragments), self.fragment_rsv1))
                 except ValueError:
                     self.close_transport(1009)
                     return
+
                 self.fragments = bytearray()
                 self.fragment_opcode = None
                 self.fragment_rsv1 = False
@@ -257,14 +277,19 @@ class WebSocket:
     def close_transport(self, code: int) -> None:
         if not self.closed:
             self.closed = True
-            self.transport.write(build_frame(Opcode.CLOSE, struct.pack(">H", code)))
-            self.transport.close()
+            self.write(build_frame(Opcode.CLOSE, struct.pack(">H", code)))
+
+            try:
+                self.transport.close()
+            except Exception:
+                pass
+
         self.queue.put_nowait(None)
 
     async def ping(self, payload: bytes = b"") -> None:
         if self.closed:
             return
-        self.transport.write(build_frame(Opcode.PING, payload))
+        self.write(build_frame(Opcode.PING, payload))
 
     async def receive(self) -> bytes | None:
         return await self.queue.get()
@@ -276,20 +301,20 @@ class WebSocket:
         if isinstance(data, str):
             payload = data.encode("utf-8")
             if self.deflate is not None:
-                self.transport.write(build_frame(Opcode.TEXT, self.deflate.compress(payload), rsv1=True))
+                self.write(build_frame(Opcode.TEXT, self.deflate.compress(payload), rsv1=True))
             else:
-                self.transport.write(build_frame(Opcode.TEXT, payload))
+                self.write(build_frame(Opcode.TEXT, payload))
 
         else:
             if self.deflate is not None:
-                self.transport.write(build_frame(Opcode.BINARY, self.deflate.compress(data), rsv1=True))
+                self.write(build_frame(Opcode.BINARY, self.deflate.compress(data), rsv1=True))
             else:
-                self.transport.write(build_frame(Opcode.BINARY, data))
+                self.write(build_frame(Opcode.BINARY, data))
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
         if self.closed:
             return
         self.closed = True
         payload = struct.pack(">H", code) + reason.encode("utf-8")
-        self.transport.write(build_frame(Opcode.CLOSE, payload))
-        self.transport.close()
+        self.write(build_frame(Opcode.CLOSE, payload))
+        self.close_transport()

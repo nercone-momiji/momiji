@@ -23,6 +23,13 @@ if TYPE_CHECKING:
     from ..app import App, Middleware
     from ..config import Config
 
+def is_websocket_upgrade(request: Request) -> bool:
+    upgrade = (request.headers.get("Upgrade", "") or "").lower().strip()
+    connection = (request.headers.get("Connection", "") or "").lower()
+    ws_key = (request.headers.get("Sec-WebSocket-Key", "") or "").strip()
+    ws_version = (request.headers.get("Sec-WebSocket-Version", "") or "").strip()
+    return upgrade == "websocket" and "upgrade" in connection and bool(ws_key) and ws_version == "13"
+
 def parse_peername(transport: asyncio.BaseTransport) -> tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int]:
     peer = transport.get_extra_info("peername")
     if not peer:
@@ -91,16 +98,25 @@ class TCPProtocol(asyncio.Protocol):
         self.keep_alive: bool = True
         self.ws: WebSocket | None = None
         self.ws_buffer: bytearray = bytearray()
+        self.pending_ws: bool = False
+        self.continue_sent: bool = False
+        self.reading_paused: bool = False
         self.keepalive_handle: asyncio.TimerHandle | None = None
         self.request_queue: asyncio.Queue[tuple[Request, bool] | None] = asyncio.Queue()
         self.request_consumer: asyncio.Task | None = None
+        self.inflight: int = 0
 
     def reset_keepalive(self) -> None:
         if self.keepalive_handle is not None:
             self.keepalive_handle.cancel()
             self.keepalive_handle = None
-        if self.transport is not None and self.keep_alive and self.ws is None:
+        if self.transport is not None and self.keep_alive and self.ws is None and self.inflight == 0:
             self.keepalive_handle = asyncio.get_running_loop().call_later(self.handler.config.keepalive_timeout, self.on_keepalive_timeout)
+
+    def cancel_keepalive(self) -> None:
+        if self.keepalive_handle is not None:
+            self.keepalive_handle.cancel()
+            self.keepalive_handle = None
 
     def on_keepalive_timeout(self) -> None:
         self.keepalive_handle = None
@@ -156,6 +172,10 @@ class TCPProtocol(asyncio.Protocol):
                 self.ws.feed_frame(frame)
             return
 
+        if self.pending_ws:
+            self.buffer.extend(data)
+            return
+
         if self.h2 is None and "http/1.1" not in self.handler.config.protocols:
             self.transport.close()
             return
@@ -198,25 +218,37 @@ class TCPProtocol(asyncio.Protocol):
 
             body_start = head_end + 4
 
-            transfer_encoding_raw = b""
-            content_length_raw: bytes | None = None
-            duplicate_content_length = False
+            transfer_encodings: list[bytes] = []
+            content_lengths: list[bytes] = []
+            expect_continue = False
+            malformed = False
             for line in bytes(self.buffer[:head_end]).split(b"\r\n")[1:]:
+                if line[:1] in (b" ", b"\t"):
+                    malformed = True
+                    break
                 name_b, sep_b, value_b = line.partition(b":")
                 if not sep_b:
-                    continue
+                    malformed = True
+                    break
                 name_lower = name_b.strip().lower()
+                value_stripped = value_b.strip()
                 if name_lower == b"transfer-encoding":
-                    transfer_encoding_raw = value_b.strip().lower()
+                    transfer_encodings.append(value_stripped.lower())
                 elif name_lower == b"content-length":
-                    value_stripped = value_b.strip()
-                    if content_length_raw is not None and value_stripped != content_length_raw:
-                        duplicate_content_length = True
-                    content_length_raw = value_stripped
+                    content_lengths.append(value_stripped)
+                elif name_lower == b"expect" and value_stripped.lower() == b"100-continue":
+                    expect_continue = True
 
+            if malformed or len(transfer_encodings) > 1 or len(content_lengths) > 1:
+                self.send_error(400, "Bad Request")
+                self.transport.close()
+                return
+
+            transfer_encoding_raw = transfer_encodings[0] if transfer_encodings else b""
+            content_length_raw = content_lengths[0] if content_lengths else None
             is_chunked = b"chunked" in [t.strip() for t in transfer_encoding_raw.split(b",")]
 
-            if (is_chunked and content_length_raw is not None) or duplicate_content_length:
+            if is_chunked and content_length_raw is not None:
                 self.send_error(400, "Bad Request")
                 self.transport.close()
                 return
@@ -232,6 +264,9 @@ class TCPProtocol(asyncio.Protocol):
                     if len(self.buffer) - body_start > max_body:
                         self.send_error(413, "Payload Too Large")
                         self.transport.close()
+                        return
+
+                    self.maybe_send_continue(expect_continue)
                     return
                 consumed = body_start + scan[1]
 
@@ -240,13 +275,17 @@ class TCPProtocol(asyncio.Protocol):
                     self.send_error(400, "Bad Request")
                     self.transport.close()
                     return
+
                 expected = int(content_length_raw)
                 if expected > max_body:
                     self.send_error(413, "Payload Too Large")
                     self.transport.close()
                     return
+
                 if len(self.buffer) - body_start < expected:
+                    self.maybe_send_continue(expect_continue)
                     return
+
                 consumed = body_start + expected
 
             else:
@@ -259,6 +298,7 @@ class TCPProtocol(asyncio.Protocol):
                 return
 
             del self.buffer[:consumed]
+            self.continue_sent = False
 
             connection_token = (request.headers.get("Connection") or "").lower()
             keep_alive = connection_token != "close"
@@ -267,8 +307,22 @@ class TCPProtocol(asyncio.Protocol):
                 self.request_consumer = self.handler.create_task(self.consume_h1_requests())
             self.request_queue.put_nowait((request, keep_alive))
 
+            if is_websocket_upgrade(request):
+                self.pending_ws = True
+                return
+
             if not keep_alive:
                 return
+
+            if not self.reading_paused and self.request_queue.qsize() >= self.handler.config.max_pipeline_buffer_len:
+                self.reading_paused = True
+                self.transport.pause_reading()
+                return
+
+    def maybe_send_continue(self, expect_continue: bool) -> None:
+        if expect_continue and not self.continue_sent and self.transport is not None and not self.transport.is_closing():
+            self.continue_sent = True
+            self.transport.write(b"HTTP/1.1 100 Continue\r\n\r\n")
 
     def send_error(self, status: int, phrase: str) -> None:
         if self.transport is not None and not self.transport.is_closing():
@@ -280,6 +334,8 @@ class TCPProtocol(asyncio.Protocol):
             if item is None or self.transport is None:
                 break
 
+            self.cancel_keepalive()
+
             request, keep_alive = item
             self.keep_alive = keep_alive
 
@@ -289,6 +345,12 @@ class TCPProtocol(asyncio.Protocol):
                 break
             if not self.keep_alive or self.transport is None:
                 break
+
+            if self.reading_paused and self.request_queue.qsize() < self.handler.config.max_pipeline_buffer_len // 2 and not self.transport.is_closing():
+                self.reading_paused = False
+                self.transport.resume_reading()
+
+            self.reset_keepalive()
 
     async def respond_h1(self, request: Request) -> None:
         if self.transport is None:
@@ -380,8 +442,21 @@ class TCPProtocol(asyncio.Protocol):
         self.transport.write(b"".join(lines))
         ws = WebSocket(self.transport, subprotocol=subprotocol, deflate=deflate, max_message_size=self.handler.config.max_websocket_message_size)
         self.ws = ws
-        self.ws_buffer = bytearray()
+
+        self.ws_buffer = self.buffer
+        self.buffer = bytearray()
+        self.pending_ws = False
+
         self.handler.create_task(self.run_websocket(request, ws))
+
+        if self.ws_buffer:
+            try:
+                frames = parse_frames(self.ws_buffer, self.handler.config.max_websocket_message_size)
+            except ValueError:
+                ws.close_transport(1009)
+                return
+            for frame in frames:
+                ws.feed_frame(frame)
 
     async def run_websocket(self, request: Request, ws: WebSocket) -> None:
         self.handler.active_ws.add(ws)
@@ -429,23 +504,43 @@ class TCPProtocol(asyncio.Protocol):
         if self.transport is None or self.h2 is None or request.h2 is None:
             return
 
-        response = await process(self.handler.app, request, middlewares=self.handler.middlewares)
+        self.inflight += 1
+        self.cancel_keepalive()
+        try:
+            response = await process(self.handler.app, request, middlewares=self.handler.middlewares)
 
-        if "h3" in self.handler.config.protocols and self.handler.config.bind_quic:
-            _, _, h3_port = self.handler.config.bind_quic[0].rpartition(':')
-            response.headers.set("Alt-Svc", f"h3=\":{int(h3_port)}\"", override=False)
+            if "h3" in self.handler.config.protocols and self.handler.config.bind_quic:
+                _, _, h3_port = self.handler.config.bind_quic[0].rpartition(':')
+                response.headers.set("Alt-Svc", f"h3=\":{int(h3_port)}\"", override=False)
 
-        if response.is_streaming:
-            await self.stream_h2(request.h2.stream_id, response)
-            return
+            if response.is_streaming:
+                await self.stream_h2(request.h2.stream_id, response)
+                return
 
-        out, alt_body = self.h2.send(request.h2.stream_id, response)
+            out, alt_body = self.h2.send(request.h2.stream_id, response)
 
-        if out:
-            self.transport.write(out)
+            if out:
+                self.transport.write(out)
 
-        if alt_body is not None:
-            await self.send_file_h2(request.h2.stream_id, alt_body, response.file_range)
+            if alt_body is not None:
+                await self.send_file_h2(request.h2.stream_id, alt_body, response.file_range)
+
+        finally:
+            self.inflight -= 1
+            if self.inflight == 0 and self.transport is not None:
+                self.reset_keepalive()
+
+    async def drain_h2_window(self, stream_id: int) -> None:
+        while self.h2 is not None and self.transport is not None and not self.transport.is_closing():
+            if self.h2.stream_buffered(stream_id) <= self.handler.config.max_stream_buffer_size:
+                return
+
+            self.h2.flow_control_event.clear()
+
+            if self.h2.stream_buffered(stream_id) <= self.handler.config.max_stream_buffer_size:
+                return
+
+            await self.h2.flow_control_event.wait()
 
     async def stream_h2(self, stream_id: int, response: Response) -> None:
         if self.transport is None or self.h2 is None:
@@ -461,6 +556,7 @@ class TCPProtocol(asyncio.Protocol):
                     out = self.h2.send_chunk(stream_id, chunk, end_stream=False)
                     if out:
                         self.transport.write(out)
+                    await self.drain_h2_window(stream_id)
 
         finally:
             if self.h2 is not None and self.transport is not None:
@@ -481,8 +577,15 @@ class TCPProtocol(asyncio.Protocol):
         ws_transport = H2WebSocketTransport(self.h2, upgrade.stream_id, self.transport)
         ws = WebSocket(ws_transport, require_masking=False, subprotocol=subprotocol, deflate=deflate, max_message_size=self.handler.config.max_websocket_message_size)
 
-        self.handler.create_task(self.read_ws_h2(upgrade.stream_id, ws))
-        await self.run_websocket(upgrade.request, ws)
+        self.inflight += 1
+        self.cancel_keepalive()
+        try:
+            self.handler.create_task(self.read_ws_h2(upgrade.stream_id, ws))
+            await self.run_websocket(upgrade.request, ws)
+        finally:
+            self.inflight -= 1
+            if self.inflight == 0 and self.transport is not None:
+                self.reset_keepalive()
 
     async def read_ws_h2(self, stream_id: int, ws: WebSocket) -> None:
         if self.h2 is None:
@@ -535,6 +638,8 @@ class TCPProtocol(asyncio.Protocol):
                     self.transport.write(out)
                 sent_any = True
                 pending = nxt
+                await self.drain_h2_window(stream_id)
+
         finally:
             await loop.run_in_executor(None, fp.close)
 
@@ -557,6 +662,7 @@ class TCPProtocol(asyncio.Protocol):
         if self.h2 is not None:
             for queue in self.h2.ws_streams.values():
                 queue.put_nowait(None)
+            self.h2.flow_control_event.set()
             self.h2 = None
 
         if self.ws is not None and not self.ws.closed:

@@ -41,20 +41,6 @@ class H3:
         self.ws_streams: dict[int, asyncio.Queue[bytes | None]] = {}
         self.max_body_size = max_body_size
 
-    def receive(self, *, client: tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int], scheme: Literal["http", "https"] = "https", secure: bool = True, tls: TLSInfo | None = None) -> tuple[list[Request], list[H3WSUpgrade]]:
-        completed: list[Request] = []
-        ws_upgrades: list[H3WSUpgrade] = []
-
-        while True:
-            quic_event = self.quic.next_event()
-            if quic_event is None:
-                break
-            r, ws = self.handle_event(quic_event, client=client, scheme=scheme, secure=secure, tls=tls)
-            completed.extend(r)
-            ws_upgrades.extend(ws)
-
-        return completed, ws_upgrades
-
     def handle_event(self, quic_event, *, client: tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, int], scheme: Literal["http", "https"] = "https", secure: bool = True, tls: TLSInfo | None = None) -> tuple[list[Request], list[H3WSUpgrade]]:
         completed: list[Request] = []
         ws_upgrades: list[H3WSUpgrade] = []
@@ -124,12 +110,7 @@ class H3:
         return Request(client=client, scheme=stream.scheme if stream.scheme in ("http", "https") else "https", secure=secure, protocol="HTTP/3.0", method=stream.method, target=stream.target, headers=stream.headers, body=body, h2=None, h3=H3Info(connection_id=self.connection_id, stream_id=stream_id), tls=tls)
 
     def send(self, stream_id: int, response: Response) -> os.PathLike | None:
-        headers: list[tuple[bytes, bytes]] = [(b":status", str(response.status_code).encode("ascii"))]
-        for name, value in response.headers.items():
-            lname = name.lower()
-            if lname in ("connection", "transfer-encoding", "keep-alive", "upgrade", "proxy-connection"):
-                continue
-            headers.append((lname.encode("ascii"), value.encode("utf-8")))
+        headers = self.build_headers(response)
 
         if response.has_real_body:
             self.connection.send_headers(stream_id, headers, end_stream=False)
@@ -144,14 +125,23 @@ class H3:
             self.connection.send_headers(stream_id, headers, end_stream=True)
             return None
 
-    def send_headers_only(self, stream_id: int, response: Response) -> None:
+    def build_headers(self, response: Response) -> list[tuple[bytes, bytes]]:
         headers: list[tuple[bytes, bytes]] = [(b":status", str(response.status_code).encode("ascii"))]
         for name, value in response.headers.items():
             lname = name.lower()
+
             if lname in ("connection", "transfer-encoding", "keep-alive", "upgrade", "proxy-connection"):
                 continue
+
+            if any(c in lname for c in "\r\n\x00") or any(c in value for c in "\r\n\x00"):
+                continue
+
             headers.append((lname.encode("ascii"), value.encode("utf-8")))
-        self.connection.send_headers(stream_id, headers, end_stream=False)
+
+        return headers
+
+    def send_headers_only(self, stream_id: int, response: Response) -> None:
+        self.connection.send_headers(stream_id, self.build_headers(response), end_stream=False)
 
     def send_chunk(self, stream_id: int, chunk: bytes, end_stream: bool) -> None:
         self.connection.send_data(stream_id, chunk, end_stream=end_stream)
